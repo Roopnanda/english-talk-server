@@ -1,0 +1,13 @@
+{
+  "name": "englishtalk-signaling-server",
+  "version": "1.0.0",
+  "description": "Zero-cost WebRTC signaling and matchmaking server",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
+
