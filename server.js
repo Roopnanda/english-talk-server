@@ -1,124 +1,137 @@
-const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
+const http = require('http');
 
-const PORT = process.env.PORT || 8080;
-const wss = new WebSocketServer({ port: PORT });
-
-const queues = {
-  beginner: [],
-  intermediate: [],
-  advanced: []
-};
-
-const rooms = new Map();
-
-wss.on('connection', (ws) => {
-  ws.id = Math.random().toString(36).substring(2, 9);
-  ws.currentRoomId = null;
-  ws.currentLevel = null;
-
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-
-      switch (data.type) {
-        case 'ACTION_JOIN_QUEUE':
-          handleJoinQueue(ws, data.level || 'intermediate', data.isVip || false);
-          break;
-
-        case 'ACTION_LEAVE_QUEUE':
-          removeFromQueue(ws);
-          break;
-
-        case 'SIGNAL_OFFER':
-        case 'SIGNAL_ANSWER':
-        case 'SIGNAL_ICE_CANDIDATE':
-          relaySignal(ws, data);
-          break;
-
-        case 'ACTION_END_CALL':
-          handleEndCall(ws);
-          break;
-      }
-    } catch (err) {
-      console.error('JSON parse error:', err);
-    }
-  });
-
-  ws.on('close', () => {
-    removeFromQueue(ws);
-    handleEndCall(ws);
-  });
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('English Talk Matchmaking Server Live\n');
 });
 
-function handleJoinQueue(ws, level, isVip) {
-  removeFromQueue(ws);
-  ws.currentLevel = level;
+const wss = new WebSocket.Server({ server });
+const waitingQueue = [];
+const activeRooms = new Map();
 
-  const queue = queues[level] || queues['intermediate'];
+wss.on('connection', (ws) => {
+    ws.id = Math.random().toString(36).substring(2, 9);
+    console.log(`[+] User connected: ${ws.id}`);
 
-  if (queue.length > 0) {
-    const peer = queue.shift();
-    const roomId = `room_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
 
-    ws.currentRoomId = roomId;
-    peer.currentRoomId = roomId;
+            switch (data.action) {
+                case 'join_queue':
+                    handleJoinQueue(ws, data);
+                    break;
+                case 'leave_queue':
+                    removeFromQueue(ws);
+                    break;
+                case 'send_offer':
+                case 'send_answer':
+                case 'send_ice_candidate':
+                    forwardSignalingData(ws, data);
+                    break;
+                case 'end_call':
+                    handleEndCall(ws);
+                    break;
+            }
+        } catch (err) {
+            console.error('Error handling message:', err);
+        }
+    });
 
-    rooms.set(roomId, { peerA: peer, peerB: ws });
+    ws.on('close', () => {
+        console.log(`[-] User disconnected: ${ws.id}`);
+        removeFromQueue(ws);
+        handleEndCall(ws);
+    });
+});
 
-    peer.send(JSON.stringify({
-      type: 'EVENT_MATCH_FOUND',
-      roomId: roomId,
-      isInitiator: true,
-      peerLevel: ws.currentLevel
-    }));
+function handleJoinQueue(ws, data) {
+    removeFromQueue(ws);
 
-    ws.send(JSON.stringify({
-      type: 'EVENT_MATCH_FOUND',
-      roomId: roomId,
-      isInitiator: false,
-      peerLevel: peer.currentLevel
-    }));
-  } else {
-    if (isVip) {
-      queue.unshift(ws);
+    const userProfile = {
+        ws,
+        level: data.level || 'Intermediate',
+        userGender: data.userGender || 'Male',
+        preferredGender: data.preferredGender || 'Any',
+        isVip: data.isVip || false
+    };
+
+    // Find a compatible partner in queue
+    const matchIndex = waitingQueue.findIndex((peer) => {
+        // 1. VIP Specific Gender Preference Check
+        if (userProfile.preferredGender !== 'Any' && userProfile.preferredGender !== peer.userGender) {
+            return false;
+        }
+        if (peer.preferredGender !== 'Any' && peer.preferredGender !== userProfile.userGender) {
+            return false;
+        }
+        return true;
+    });
+
+    if (matchIndex !== -1) {
+        const peer = waitingQueue.splice(matchIndex, 1)[0];
+        const roomId = `room_${userProfile.ws.id}_${peer.ws.id}`;
+
+        activeRooms.set(userProfile.ws.id, { peerWs: peer.ws, roomId });
+        activeRooms.set(peer.ws.id, { peerWs: userProfile.ws, roomId });
+
+        // Notify Initiator
+        userProfile.ws.send(JSON.stringify({
+            type: 'match_found',
+            roomId: roomId,
+            isInitiator: true,
+            peerLevel: peer.level
+        }));
+
+        // Notify Receiver
+        peer.ws.send(JSON.stringify({
+            type: 'match_found',
+            roomId: roomId,
+            isInitiator: false,
+            peerLevel: userProfile.level
+        }));
+
+        console.log(`[MATCH] Room created: ${roomId} (${userProfile.userGender} <-> ${peer.userGender})`);
     } else {
-      queue.push(ws);
+        waitingQueue.push(userProfile);
+        console.log(`[QUEUE] User ${ws.id} waiting. Current queue size: ${waitingQueue.length}`);
     }
-    ws.send(JSON.stringify({ type: 'EVENT_WAITING_FOR_MATCH' }));
-  }
 }
 
 function removeFromQueue(ws) {
-  if (ws.currentLevel && queues[ws.currentLevel]) {
-    queues[ws.currentLevel] = queues[ws.currentLevel].filter((client) => client.id !== ws.id);
-  }
+    const idx = waitingQueue.findIndex((u) => u.ws.id === ws.id);
+    if (idx !== -1) {
+        waitingQueue.splice(idx, 1);
+        console.log(`[QUEUE] Removed user ${ws.id}`);
+    }
 }
 
-function relaySignal(ws, data) {
-  if (!ws.currentRoomId || !rooms.has(ws.currentRoomId)) return;
-
-  const room = rooms.get(ws.currentRoomId);
-  const target = room.peerA.id === ws.id ? room.peerB : room.peerA;
-
-  if (target && target.readyState === target.OPEN) {
-    target.send(JSON.stringify(data));
-  }
+function forwardSignalingData(ws, data) {
+    const session = activeRooms.get(ws.id);
+    if (session && session.peerWs && session.peerWs.readyState === WebSocket.OPEN) {
+        if (data.action === 'send_offer') {
+            session.peerWs.send(JSON.stringify({ type: 'offer', sdp: data.sdp }));
+        } else if (data.action === 'send_answer') {
+            session.peerWs.send(JSON.stringify({ type: 'answer', sdp: data.sdp }));
+        } else if (data.action === 'send_ice_candidate') {
+            session.peerWs.send(JSON.stringify({ type: 'ice_candidate', candidate: data.candidate }));
+        }
+    }
 }
 
 function handleEndCall(ws) {
-  if (!ws.currentRoomId || !rooms.has(ws.currentRoomId)) return;
-
-  const room = rooms.get(ws.currentRoomId);
-  const target = room.peerA.id === ws.id ? room.peerB : room.peerA;
-
-  if (target && target.readyState === target.OPEN) {
-    target.send(JSON.stringify({ type: 'EVENT_CALL_ENDED' }));
-    target.currentRoomId = null;
-  }
-
-  rooms.delete(ws.currentRoomId);
-  ws.currentRoomId = null;
+    const session = activeRooms.get(ws.id);
+    if (session) {
+        if (session.peerWs && session.peerWs.readyState === WebSocket.OPEN) {
+            session.peerWs.send(JSON.stringify({ type: 'call_ended' }));
+        }
+        activeRooms.delete(session.peerWs?.id);
+        activeRooms.delete(ws.id);
+    }
 }
 
-console.log(`Matchmaking Server listening on port ${PORT}`);
-
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => {
+    console.log(`Matchmaking Server listening on port ${PORT}`);
+});
