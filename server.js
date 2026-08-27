@@ -9,20 +9,21 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// Active waiting queue and live rooms
 let waitingQueue = [];
-const activeRooms = new Map(); // roomId -> { user1: ws, user2: ws }
+const activeRooms = new Map();
 
 function cleanupClient(ws) {
-    // Remove from waiting queue
     waitingQueue = waitingQueue.filter(item => item.ws !== ws);
 
-    // If inside an active room, notify the other peer
     for (const [roomId, room] of activeRooms.entries()) {
         if (room.user1 === ws || room.user2 === ws) {
             const peer = room.user1 === ws ? room.user2 : room.user1;
             if (peer && peer.readyState === WebSocket.OPEN) {
-                peer.send(JSON.stringify({ type: 'call_ended', roomId }));
+                try {
+                    peer.send(JSON.stringify({ type: 'call_ended', roomId }));
+                } catch (e) {
+                    console.error('[Send call_ended error]', e);
+                }
             }
             activeRooms.delete(roomId);
             console.log(`[Room Cleaned] ${roomId}`);
@@ -33,11 +34,6 @@ function cleanupClient(ws) {
 
 wss.on('connection', (ws) => {
     console.log('[Connection] New client connected');
-    ws.isAlive = true;
-
-    ws.on('pong', () => {
-        ws.isAlive = true;
-    });
 
     ws.on('message', (message) => {
         try {
@@ -46,26 +42,30 @@ wss.on('connection', (ws) => {
 
             switch (type) {
                 case 'join_queue': {
-                    // Remove if already in queue
-                    waitingQueue = waitingQueue.filter(item => item.ws !== ws);
+                    waitingQueue = waitingQueue.filter(item => item.ws !== ws && item.ws.readyState === WebSocket.OPEN);
 
                     const userLevel = level || 'Intermediate';
                     const userGender = gender || 'Male';
                     const targetFemale = !!talkToFemaleOnly;
                     const vipStatus = !!isVip;
 
-                    console.log(`[Queue] User joined: level=${userLevel}, gender=${userGender}, vip=${vipStatus}`);
+                    console.log(`[Queue] User joined: level=${userLevel}, gender=${userGender}`);
 
-                    // Attempt exact level match first
-                    let matchIndex = waitingQueue.findIndex(peer => {
+                    // 1. Try finding a partner
+                    let matchIndex = -1;
+
+                    // Match with same level first
+                    matchIndex = waitingQueue.findIndex(peer => {
+                        if (peer.ws === ws || peer.ws.readyState !== WebSocket.OPEN) return false;
                         if (targetFemale && peer.gender !== 'Female') return false;
                         if (peer.targetFemale && userGender !== 'Female') return false;
                         return peer.level === userLevel;
                     });
 
-                    // If no exact match and not strictly VIP locked, pair with any available peer
-                    if (matchIndex === -1 && !vipStatus && waitingQueue.length > 0) {
+                    // If no same-level match, pair with ANY available waiting user
+                    if (matchIndex === -1 && waitingQueue.length > 0) {
                         matchIndex = waitingQueue.findIndex(peer => {
+                            if (peer.ws === ws || peer.ws.readyState !== WebSocket.OPEN) return false;
                             if (targetFemale && peer.gender !== 'Female') return false;
                             if (peer.targetFemale && userGender !== 'Female') return false;
                             return true;
@@ -78,7 +78,7 @@ wss.on('connection', (ws) => {
 
                         activeRooms.set(newRoomId, { user1: ws, user2: matchedPeer.ws });
 
-                        // Notify Initiator (User 1)
+                        // Notify Initiator
                         ws.send(JSON.stringify({
                             type: 'match_found',
                             roomId: newRoomId,
@@ -86,7 +86,7 @@ wss.on('connection', (ws) => {
                             peerLevel: matchedPeer.level
                         }));
 
-                        // Notify Receiver (User 2)
+                        // Notify Receiver
                         matchedPeer.ws.send(JSON.stringify({
                             type: 'match_found',
                             roomId: newRoomId,
@@ -94,9 +94,8 @@ wss.on('connection', (ws) => {
                             peerLevel: userLevel
                         }));
 
-                        console.log(`[Matched] ${newRoomId} between two users`);
+                        console.log(`[Matched] ${newRoomId}`);
                     } else {
-                        // Place into queue
                         waitingQueue.push({
                             ws,
                             level: userLevel,
@@ -148,41 +147,18 @@ wss.on('connection', (ws) => {
                 }
 
                 case 'end_call': {
-                    if (roomId && activeRooms.has(roomId)) {
-                        const room = activeRooms.get(roomId);
-                        const target = room.user1 === ws ? room.user2 : room.user1;
-                        if (target && target.readyState === WebSocket.OPEN) {
-                            target.send(JSON.stringify({ type: 'call_ended', roomId }));
-                        }
-                        activeRooms.delete(roomId);
-                        console.log(`[End Call] ${roomId}`);
-                    }
+                    cleanupClient(ws);
                     break;
                 }
             }
         } catch (err) {
-            console.error('[Error handling message]', err);
+            console.error('[Message error]', err);
         }
     });
 
-    ws.on('close', () => {
-        cleanupClient(ws);
-    });
-
-    ws.on('error', (err) => {
-        console.error('[Client Error]', err);
-        cleanupClient(ws);
-    });
+    ws.on('close', () => cleanupClient(ws));
+    ws.on('error', () => cleanupClient(ws));
 });
-
-// Periodic ping to keep cloud hosting connections alive
-setInterval(() => {
-    wss.clients.forEach((ws) => {
-        if (!ws.isAlive) return ws.terminate();
-        ws.isAlive = false;
-        ws.ping();
-    });
-}, 25000);
 
 server.listen(PORT, () => {
     console.log(`Server listening on port ${PORT}`);
