@@ -1,155 +1,156 @@
-const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const WebSocket = require('ws');
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*" }
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('English Talk Signaling Server Running');
 });
 
+const wss = new WebSocket.Server({ server });
 const PORT = process.env.PORT || 3000;
 
-// Regular waiting queues grouped by level
 const waitingQueues = {
     Beginner: [],
     Intermediate: [],
     Advanced: []
 };
 
-// Map to track active reconnect intents: socketId -> targetSocketId
+// Map to track active reconnect requests: socketId -> targetSocketId
 const reconnectRequests = new Map();
+const clients = new Map(); // socketId -> ws
 
-io.on('connection', (socket) => {
-    console.log(`User connected: ${socket.id}`);
+let nextId = 1;
 
-    // --- NORMAL MATCHMAKING QUEUE ---
-    socket.on('join_queue', (data) => {
-        const { level, userGender, talkToFemaleOnly, isVip } = data;
-        
-        // Remove any stale reconnect intent when entering normal search
-        reconnectRequests.delete(socket.id);
+wss.on('connection', (ws) => {
+    const socketId = "user_" + (nextId++);
+    ws.socketId = socketId;
+    clients.set(socketId, ws);
+    console.log(`Connected: ${socketId}`);
 
-        const targetQueue = waitingQueues[level] || waitingQueues['Intermediate'];
-        
-        const existingIdx = targetQueue.findIndex(u => u.socket.id === socket.id);
-        if (existingIdx !== -1) targetQueue.splice(existingIdx, 1);
+    ws.on('message', (message) => {
+        try {
+            const parsed = JSON.parse(message);
+            const event = parsed.event;
+            const data = parsed.data || {};
 
-        if (targetQueue.length > 0) {
-            const partner = targetQueue.shift();
-            const roomId = `room_${socket.id}_${partner.socket.id}_${Date.now()}`;
+            if (event === 'join_queue') {
+                const { level, userGender, talkToFemaleOnly, isVip } = data;
+                reconnectRequests.delete(socketId);
 
-            socket.join(roomId);
-            partner.socket.join(roomId);
+                const targetQueue = waitingQueues[level] || waitingQueues['Intermediate'];
+                const existingIdx = targetQueue.findIndex(u => u.socketId === socketId);
+                if (existingIdx !== -1) targetQueue.splice(existingIdx, 1);
 
-            socket.emit('match_found', {
-                roomId: roomId,
-                isInitiator: true,
-                peerLevel: partner.level,
-                peerId: partner.socket.id,
-                isReconnect: false
-            });
+                if (targetQueue.length > 0) {
+                    const partner = targetQueue.shift();
+                    const roomId = `room_${socketId}_${partner.socketId}_${Date.now()}`;
 
-            partner.socket.emit('match_found', {
-                roomId: roomId,
-                isInitiator: false,
-                peerLevel: level,
-                peerId: socket.id,
-                isReconnect: false
-            });
-        } else {
-            targetQueue.push({ socket, level, userGender, talkToFemaleOnly, isVip });
-        }
-    });
+                    ws.roomId = roomId;
+                    partner.ws.roomId = roomId;
 
-    socket.on('leave_queue', () => {
-        removeFromAllQueues(socket.id);
-        reconnectRequests.delete(socket.id);
-    });
+                    send(ws, 'match_found', {
+                        roomId: roomId,
+                        isInitiator: true,
+                        peerLevel: partner.level,
+                        peerId: partner.socketId,
+                        isReconnect: false
+                    });
 
-    // --- MUTUAL RECONNECT TO LAST CALLER ---
-    socket.on('request_reconnect', (data) => {
-        const { targetPeerId, myLevel } = data;
-        
-        removeFromAllQueues(socket.id);
+                    send(partner.ws, 'match_found', {
+                        roomId: roomId,
+                        isInitiator: false,
+                        peerLevel: level,
+                        peerId: socketId,
+                        isReconnect: false
+                    });
+                } else {
+                    targetQueue.push({ ws, socketId, level, userGender, talkToFemaleOnly, isVip });
+                }
+            } else if (event === 'leave_queue') {
+                removeFromAllQueues(socketId);
+                reconnectRequests.delete(socketId);
+            } else if (event === 'request_reconnect') {
+                const { targetPeerId, myLevel } = data;
+                removeFromAllQueues(socketId);
 
-        // Check if the target user already requested to reconnect with this socket
-        const partnerTarget = reconnectRequests.get(targetPeerId);
+                const partnerTarget = reconnectRequests.get(targetPeerId);
 
-        if (partnerTarget === socket.id) {
-            // Mutual match verified
-            reconnectRequests.delete(socket.id);
-            reconnectRequests.delete(targetPeerId);
+                if (partnerTarget === socketId) {
+                    // Mutual match verified
+                    reconnectRequests.delete(socketId);
+                    reconnectRequests.delete(targetPeerId);
 
-            const partnerSocket = io.sockets.sockets.get(targetPeerId);
-            if (partnerSocket) {
-                const roomId = `reconnect_${socket.id}_${targetPeerId}_${Date.now()}`;
-                
-                socket.join(roomId);
-                partnerSocket.join(roomId);
+                    const partnerWs = clients.get(targetPeerId);
+                    if (partnerWs && partnerWs.readyState === WebSocket.OPEN) {
+                        const roomId = `reconnect_${socketId}_${targetPeerId}_${Date.now()}`;
+                        ws.roomId = roomId;
+                        partnerWs.roomId = roomId;
 
-                socket.emit('match_found', {
-                    roomId: roomId,
-                    isInitiator: true,
-                    peerLevel: partnerSocket.dataLevel || "Intermediate",
-                    peerId: targetPeerId,
-                    isReconnect: true
-                });
+                        send(ws, 'match_found', {
+                            roomId: roomId,
+                            isInitiator: true,
+                            peerLevel: partnerWs.dataLevel || "Intermediate",
+                            peerId: targetPeerId,
+                            isReconnect: true
+                        });
 
-                partnerSocket.emit('match_found', {
-                    roomId: roomId,
-                    isInitiator: false,
-                    peerLevel: myLevel || "Intermediate",
-                    peerId: socket.id,
-                    isReconnect: true
-                });
-            } else {
-                socket.emit('reconnect_failed', { reason: "Partner is offline." });
+                        send(partnerWs, 'match_found', {
+                            roomId: roomId,
+                            isInitiator: false,
+                            peerLevel: myLevel || "Intermediate",
+                            peerId: socketId,
+                            isReconnect: true
+                        });
+                    } else {
+                        send(ws, 'reconnect_failed', { reason: "Partner is offline." });
+                    }
+                } else {
+                    ws.dataLevel = myLevel;
+                    reconnectRequests.set(socketId, targetPeerId);
+                    send(ws, 'reconnect_waiting', {});
+                }
+            } else if (event === 'cancel_reconnect') {
+                reconnectRequests.delete(socketId);
+            } else if (event === 'offer' || event === 'answer' || event === 'ice_candidate') {
+                broadcastToRoom(ws, event, data);
+            } else if (event === 'end_call') {
+                broadcastToRoom(ws, 'call_ended', {});
+                ws.roomId = null;
             }
-        } else {
-            // Save intent and await partner's mutual button press
-            socket.dataLevel = myLevel;
-            reconnectRequests.set(socket.id, targetPeerId);
-            socket.emit('reconnect_waiting');
+        } catch (e) {
+            console.error("Msg error:", e);
         }
     });
 
-    socket.on('cancel_reconnect', () => {
-        reconnectRequests.delete(socket.id);
-    });
-
-    // --- WEBRTC SIGNALING PASS-THROUGH ---
-    socket.on('offer', (data) => {
-        socket.to(data.roomId).emit('offer', data.sdp);
-    });
-
-    socket.on('answer', (data) => {
-        socket.to(data.roomId).emit('answer', data.sdp);
-    });
-
-    socket.on('ice_candidate', (data) => {
-        socket.to(data.roomId).emit('ice_candidate', data.candidate);
-    });
-
-    socket.on('end_call', (data) => {
-        if (data && data.roomId) {
-            socket.to(data.roomId).emit('call_ended');
-            socket.leave(data.roomId);
-        }
-    });
-
-    socket.on('disconnect', () => {
-        removeFromAllQueues(socket.id);
-        reconnectRequests.delete(socket.id);
+    ws.on('close', () => {
+        removeFromAllQueues(socketId);
+        reconnectRequests.delete(socketId);
+        clients.delete(socketId);
+        console.log(`Disconnected: ${socketId}`);
     });
 });
 
+function send(ws, event, data) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ event, data }));
+    }
+}
+
+function broadcastToRoom(senderWs, event, data) {
+    if (!senderWs.roomId) return;
+    for (const client of clients.values()) {
+        if (client !== senderWs && client.roomId === senderWs.roomId && client.readyState === WebSocket.OPEN) {
+            send(client, event, data);
+        }
+    }
+}
+
 function removeFromAllQueues(socketId) {
     for (const lvl in waitingQueues) {
-        waitingQueues[lvl] = waitingQueues[lvl].filter(u => u.socket.id !== socketId);
+        waitingQueues[lvl] = waitingQueues[lvl].filter(u => u.socketId !== socketId);
     }
 }
 
 server.listen(PORT, () => {
-    console.log(`Signaling server running on port ${PORT}`);
+    console.log(`WebSocket server listening on port ${PORT}`);
 });
