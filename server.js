@@ -1,165 +1,155 @@
-const WebSocket = require('ws');
+const express = require('express');
 const http = require('http');
+const { Server } = require('socket.io');
 
-const PORT = process.env.PORT || 3000;
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('English Talk Signaling Server is Running Live!\n');
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: "*" }
 });
 
-const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 3000;
 
-let waitingQueue = [];
-const activeRooms = new Map();
+// Regular waiting queues grouped by level
+const waitingQueues = {
+    Beginner: [],
+    Intermediate: [],
+    Advanced: []
+};
 
-function cleanupClient(ws) {
-    waitingQueue = waitingQueue.filter(item => item.ws !== ws);
+// Map to track active reconnect intents: socketId -> targetSocketId
+const reconnectRequests = new Map();
 
-    for (const [roomId, room] of activeRooms.entries()) {
-        if (room.user1 === ws || room.user2 === ws) {
-            const peer = room.user1 === ws ? room.user2 : room.user1;
-            if (peer && peer.readyState === WebSocket.OPEN) {
-                try {
-                    peer.send(JSON.stringify({ type: 'call_ended', roomId }));
-                } catch (e) {
-                    console.error('[Send call_ended error]', e);
-                }
-            }
-            activeRooms.delete(roomId);
-            console.log(`[Room Cleaned] ${roomId}`);
-            break;
-        }
-    }
-}
+io.on('connection', (socket) => {
+    console.log(`User connected: ${socket.id}`);
 
-wss.on('connection', (ws) => {
-    console.log('[Connection] New client connected');
+    // --- NORMAL MATCHMAKING QUEUE ---
+    socket.on('join_queue', (data) => {
+        const { level, userGender, talkToFemaleOnly, isVip } = data;
+        
+        // Remove any stale reconnect intent when entering normal search
+        reconnectRequests.delete(socket.id);
 
-    ws.on('message', (message) => {
-        try {
-            const data = JSON.parse(message);
-            const { type, roomId, sdp, candidate, level, gender, talkToFemaleOnly, isVip } = data;
+        const targetQueue = waitingQueues[level] || waitingQueues['Intermediate'];
+        
+        const existingIdx = targetQueue.findIndex(u => u.socket.id === socket.id);
+        if (existingIdx !== -1) targetQueue.splice(existingIdx, 1);
 
-            switch (type) {
-                case 'join_queue': {
-                    waitingQueue = waitingQueue.filter(item => item.ws !== ws && item.ws.readyState === WebSocket.OPEN);
+        if (targetQueue.length > 0) {
+            const partner = targetQueue.shift();
+            const roomId = `room_${socket.id}_${partner.socket.id}_${Date.now()}`;
 
-                    const userLevel = level || 'Intermediate';
-                    const userGender = gender || 'Male';
-                    const targetFemale = !!talkToFemaleOnly;
-                    const vipStatus = !!isVip;
+            socket.join(roomId);
+            partner.socket.join(roomId);
 
-                    console.log(`[Queue] User joined: level=${userLevel}, gender=${userGender}`);
+            socket.emit('match_found', {
+                roomId: roomId,
+                isInitiator: true,
+                peerLevel: partner.level,
+                peerId: partner.socket.id,
+                isReconnect: false
+            });
 
-                    // 1. Try finding a partner
-                    let matchIndex = -1;
-
-                    // Match with same level first
-                    matchIndex = waitingQueue.findIndex(peer => {
-                        if (peer.ws === ws || peer.ws.readyState !== WebSocket.OPEN) return false;
-                        if (targetFemale && peer.gender !== 'Female') return false;
-                        if (peer.targetFemale && userGender !== 'Female') return false;
-                        return peer.level === userLevel;
-                    });
-
-                    // If no same-level match, pair with ANY available waiting user
-                    if (matchIndex === -1 && waitingQueue.length > 0) {
-                        matchIndex = waitingQueue.findIndex(peer => {
-                            if (peer.ws === ws || peer.ws.readyState !== WebSocket.OPEN) return false;
-                            if (targetFemale && peer.gender !== 'Female') return false;
-                            if (peer.targetFemale && userGender !== 'Female') return false;
-                            return true;
-                        });
-                    }
-
-                    if (matchIndex !== -1) {
-                        const matchedPeer = waitingQueue.splice(matchIndex, 1)[0];
-                        const newRoomId = `room_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-
-                        activeRooms.set(newRoomId, { user1: ws, user2: matchedPeer.ws });
-
-                        // Notify Initiator
-                        ws.send(JSON.stringify({
-                            type: 'match_found',
-                            roomId: newRoomId,
-                            isInitiator: true,
-                            peerLevel: matchedPeer.level
-                        }));
-
-                        // Notify Receiver
-                        matchedPeer.ws.send(JSON.stringify({
-                            type: 'match_found',
-                            roomId: newRoomId,
-                            isInitiator: false,
-                            peerLevel: userLevel
-                        }));
-
-                        console.log(`[Matched] ${newRoomId}`);
-                    } else {
-                        waitingQueue.push({
-                            ws,
-                            level: userLevel,
-                            gender: userGender,
-                            targetFemale,
-                            isVip: vipStatus
-                        });
-                    }
-                    break;
-                }
-
-                case 'leave_queue': {
-                    waitingQueue = waitingQueue.filter(item => item.ws !== ws);
-                    console.log('[Queue] User left queue');
-                    break;
-                }
-
-                case 'offer': {
-                    if (roomId && activeRooms.has(roomId)) {
-                        const room = activeRooms.get(roomId);
-                        const target = room.user1 === ws ? room.user2 : room.user1;
-                        if (target && target.readyState === WebSocket.OPEN) {
-                            target.send(JSON.stringify({ type: 'offer', sdp }));
-                        }
-                    }
-                    break;
-                }
-
-                case 'answer': {
-                    if (roomId && activeRooms.has(roomId)) {
-                        const room = activeRooms.get(roomId);
-                        const target = room.user1 === ws ? room.user2 : room.user1;
-                        if (target && target.readyState === WebSocket.OPEN) {
-                            target.send(JSON.stringify({ type: 'answer', sdp }));
-                        }
-                    }
-                    break;
-                }
-
-                case 'ice_candidate': {
-                    if (roomId && activeRooms.has(roomId)) {
-                        const room = activeRooms.get(roomId);
-                        const target = room.user1 === ws ? room.user2 : room.user1;
-                        if (target && target.readyState === WebSocket.OPEN) {
-                            target.send(JSON.stringify({ type: 'ice_candidate', candidate }));
-                        }
-                    }
-                    break;
-                }
-
-                case 'end_call': {
-                    cleanupClient(ws);
-                    break;
-                }
-            }
-        } catch (err) {
-            console.error('[Message error]', err);
+            partner.socket.emit('match_found', {
+                roomId: roomId,
+                isInitiator: false,
+                peerLevel: level,
+                peerId: socket.id,
+                isReconnect: false
+            });
+        } else {
+            targetQueue.push({ socket, level, userGender, talkToFemaleOnly, isVip });
         }
     });
 
-    ws.on('close', () => cleanupClient(ws));
-    ws.on('error', () => cleanupClient(ws));
+    socket.on('leave_queue', () => {
+        removeFromAllQueues(socket.id);
+        reconnectRequests.delete(socket.id);
+    });
+
+    // --- MUTUAL RECONNECT TO LAST CALLER ---
+    socket.on('request_reconnect', (data) => {
+        const { targetPeerId, myLevel } = data;
+        
+        removeFromAllQueues(socket.id);
+
+        // Check if the target user already requested to reconnect with this socket
+        const partnerTarget = reconnectRequests.get(targetPeerId);
+
+        if (partnerTarget === socket.id) {
+            // Mutual match verified
+            reconnectRequests.delete(socket.id);
+            reconnectRequests.delete(targetPeerId);
+
+            const partnerSocket = io.sockets.sockets.get(targetPeerId);
+            if (partnerSocket) {
+                const roomId = `reconnect_${socket.id}_${targetPeerId}_${Date.now()}`;
+                
+                socket.join(roomId);
+                partnerSocket.join(roomId);
+
+                socket.emit('match_found', {
+                    roomId: roomId,
+                    isInitiator: true,
+                    peerLevel: partnerSocket.dataLevel || "Intermediate",
+                    peerId: targetPeerId,
+                    isReconnect: true
+                });
+
+                partnerSocket.emit('match_found', {
+                    roomId: roomId,
+                    isInitiator: false,
+                    peerLevel: myLevel || "Intermediate",
+                    peerId: socket.id,
+                    isReconnect: true
+                });
+            } else {
+                socket.emit('reconnect_failed', { reason: "Partner is offline." });
+            }
+        } else {
+            // Save intent and await partner's mutual button press
+            socket.dataLevel = myLevel;
+            reconnectRequests.set(socket.id, targetPeerId);
+            socket.emit('reconnect_waiting');
+        }
+    });
+
+    socket.on('cancel_reconnect', () => {
+        reconnectRequests.delete(socket.id);
+    });
+
+    // --- WEBRTC SIGNALING PASS-THROUGH ---
+    socket.on('offer', (data) => {
+        socket.to(data.roomId).emit('offer', data.sdp);
+    });
+
+    socket.on('answer', (data) => {
+        socket.to(data.roomId).emit('answer', data.sdp);
+    });
+
+    socket.on('ice_candidate', (data) => {
+        socket.to(data.roomId).emit('ice_candidate', data.candidate);
+    });
+
+    socket.on('end_call', (data) => {
+        if (data && data.roomId) {
+            socket.to(data.roomId).emit('call_ended');
+            socket.leave(data.roomId);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        removeFromAllQueues(socket.id);
+        reconnectRequests.delete(socket.id);
+    });
 });
 
+function removeFromAllQueues(socketId) {
+    for (const lvl in waitingQueues) {
+        waitingQueues[lvl] = waitingQueues[lvl].filter(u => u.socket.id !== socketId);
+    }
+}
+
 server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Signaling server running on port ${PORT}`);
 });
