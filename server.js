@@ -11,13 +11,13 @@ const PORT = process.env.PORT || 3000;
 
 const waitingQueues = {
     Beginner: [],
-    Intermediate: [],
     Advanced: []
 };
 
 // Map to track active reconnect requests: socketId -> targetSocketId
 const reconnectRequests = new Map();
 const clients = new Map(); // socketId -> ws
+const rooms = new Map();   // roomId -> Set of socketIds
 
 let nextId = 1;
 
@@ -36,17 +36,31 @@ wss.on('connection', (ws) => {
             if (event === 'join_queue') {
                 const { level, userGender, talkToFemaleOnly, isVip } = data;
                 reconnectRequests.delete(socketId);
+                removeFromAllQueues(socketId);
 
-                const targetQueue = waitingQueues[level] || waitingQueues['Intermediate'];
-                const existingIdx = targetQueue.findIndex(u => u.socketId === socketId);
-                if (existingIdx !== -1) targetQueue.splice(existingIdx, 1);
+                // --- 1. SAME-LEVEL MATCH ATTEMPT ---
+                let partner = null;
+                const preferredQueue = waitingQueues[level] || waitingQueues['Beginner'];
 
-                if (targetQueue.length > 0) {
-                    const partner = targetQueue.shift();
+                if (preferredQueue.length > 0) {
+                    partner = preferredQueue.shift();
+                } else {
+                    // --- 2. CROSS-LEVEL INSTANT FALLBACK ---
+                    const fallbackLevel = (level === 'Advanced') ? 'Beginner' : 'Advanced';
+                    if (waitingQueues[fallbackLevel] && waitingQueues[fallbackLevel].length > 0) {
+                        partner = waitingQueues[fallbackLevel].shift();
+                    }
+                }
+
+                if (partner) {
                     const roomId = `room_${socketId}_${partner.socketId}_${Date.now()}`;
 
                     ws.roomId = roomId;
                     partner.ws.roomId = roomId;
+
+                    rooms.set(roomId, new Set([socketId, partner.socketId]));
+
+                    console.log(`Match established: ${socketId} (${level}) <--> ${partner.socketId} (${partner.level}) in ${roomId}`);
 
                     send(ws, 'match_found', {
                         roomId: roomId,
@@ -64,7 +78,8 @@ wss.on('connection', (ws) => {
                         isReconnect: false
                     });
                 } else {
-                    targetQueue.push({ ws, socketId, level, userGender, talkToFemaleOnly, isVip });
+                    preferredQueue.push({ ws, socketId, level, userGender, talkToFemaleOnly, isVip });
+                    console.log(`User ${socketId} added to queue: ${level}`);
                 }
             } else if (event === 'leave_queue') {
                 removeFromAllQueues(socketId);
@@ -86,10 +101,12 @@ wss.on('connection', (ws) => {
                         ws.roomId = roomId;
                         partnerWs.roomId = roomId;
 
+                        rooms.set(roomId, new Set([socketId, targetPeerId]));
+
                         send(ws, 'match_found', {
                             roomId: roomId,
                             isInitiator: true,
-                            peerLevel: partnerWs.dataLevel || "Intermediate",
+                            peerLevel: partnerWs.dataLevel || "Beginner",
                             peerId: targetPeerId,
                             isReconnect: true
                         });
@@ -97,7 +114,7 @@ wss.on('connection', (ws) => {
                         send(partnerWs, 'match_found', {
                             roomId: roomId,
                             isInitiator: false,
-                            peerLevel: myLevel || "Intermediate",
+                            peerLevel: myLevel || "Beginner",
                             peerId: socketId,
                             isReconnect: true
                         });
@@ -112,9 +129,10 @@ wss.on('connection', (ws) => {
             } else if (event === 'cancel_reconnect') {
                 reconnectRequests.delete(socketId);
             } else if (event === 'offer' || event === 'answer' || event === 'ice_candidate') {
-                broadcastToRoom(ws, event, data);
+                relayToRoom(ws, event, data);
             } else if (event === 'end_call') {
-                broadcastToRoom(ws, 'call_ended', {});
+                relayToRoom(ws, 'call_ended', {});
+                cleanUpRoom(ws.roomId);
                 ws.roomId = null;
             }
         } catch (e) {
@@ -125,6 +143,10 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         removeFromAllQueues(socketId);
         reconnectRequests.delete(socketId);
+        if (ws.roomId) {
+            relayToRoom(ws, 'call_ended', {});
+            cleanUpRoom(ws.roomId);
+        }
         clients.delete(socketId);
         console.log(`Disconnected: ${socketId}`);
     });
@@ -136,12 +158,26 @@ function send(ws, event, data) {
     }
 }
 
-function broadcastToRoom(senderWs, event, data) {
-    if (!senderWs.roomId) return;
-    for (const client of clients.values()) {
-        if (client !== senderWs && client.roomId === senderWs.roomId && client.readyState === WebSocket.OPEN) {
-            send(client, event, data);
+function relayToRoom(senderWs, event, data) {
+    const roomId = data.roomId || senderWs.roomId;
+    if (!roomId) return;
+
+    const roomMembers = rooms.get(roomId);
+    if (roomMembers) {
+        for (const peerId of roomMembers) {
+            if (peerId !== senderWs.socketId) {
+                const peerWs = clients.get(peerId);
+                if (peerWs && peerWs.readyState === WebSocket.OPEN) {
+                    send(peerWs, event, data);
+                }
+            }
         }
+    }
+}
+
+function cleanUpRoom(roomId) {
+    if (roomId && rooms.has(roomId)) {
+        rooms.delete(roomId);
     }
 }
 
