@@ -9,12 +9,10 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// Queue storage structures
+// Queue storage
 const queues = {
-    // English tiers
     ENGLISH_BEGINNER: [],
     ENGLISH_ADVANCED: [],
-    // 12 Isolated Regional pools
     HINDI: [],
     PUNJABI: [],
     MARATHI: [],
@@ -29,25 +27,14 @@ const queues = {
     ARABIC: []
 };
 
-// Map of active peer sockets: socketId -> WebSocket instance
 const activeSockets = new Map();
-
-// Map of active calls: socketId -> { partnerId, roomId }
 const activeCalls = new Map();
-
-// Recent partners anti-repeat map: socketId -> Set of recently spoken partnerIds
 const recentPartners = new Map();
-
-// Pending reconnect requests: targetPeerId -> { requesterId, level, timestamp }
 const reconnectRequests = new Map();
 
 function generateRoomId() {
     return 'room_' + Math.random().toString(36).substring(2, 10);
 }
-
-// ----------------------------------------------------
-// QUEUE MANAGEMENT & CLEANUP
-// ----------------------------------------------------
 
 function removeFromAllQueues(socketId) {
     for (const key of Object.keys(queues)) {
@@ -55,37 +42,27 @@ function removeFromAllQueues(socketId) {
     }
 }
 
-// Safe Heartbeat: Keep TCP alive across Render without aggressive termination
-const heartbeatInterval = setInterval(() => {
+// Gentle keep-alive ping for cloud hosting
+setInterval(() => {
     for (const [id, sock] of activeSockets.entries()) {
         if (sock.readyState === WebSocket.OPEN) {
             try {
                 sock.ping(() => {});
-            } catch (e) {
-                // Ignore ping dispatch errors
-            }
+            } catch (e) {}
         } else if (sock.readyState === WebSocket.CLOSED || sock.readyState === WebSocket.CLOSING) {
             activeSockets.delete(id);
             removeFromAllQueues(id);
         }
     }
-
-    // Clean stale queues
-    for (const key of Object.keys(queues)) {
-        queues[key] = queues[key].filter(entry => {
-            const client = activeSockets.get(entry.socketId);
-            return client && client.readyState === WebSocket.OPEN;
-        });
-    }
-}, 25000);
+}, 30000);
 
 // ----------------------------------------------------
-// MATCHMAKING ENGINE
+// MATCHMAKING CORE
 // ----------------------------------------------------
 
 function matchUsers() {
     try {
-        // 1. Process 12 Isolated Regional Pools
+        // 1. Regional Pools (12 Languages - Isolated)
         const regionalPools = [
             'HINDI', 'PUNJABI', 'MARATHI', 'BENGALI', 'BHOJPURI',
             'GUJARATI', 'KANNADA', 'MALAYALAM', 'TAMIL', 'TELUGU',
@@ -95,14 +72,14 @@ function matchUsers() {
         for (const lang of regionalPools) {
             const pool = queues[lang];
             if (pool && pool.length >= 2) {
-                processRegionalPairing(pool);
+                processQueuePairing(pool);
             }
         }
 
-        // 2. Process English Pools with Tier Priority & Cross-Tier Fallback
+        // 2. English Pools (Beginner & Advanced with 5s fallback)
         processEnglishMatchmaking();
     } catch (err) {
-        console.error('[Matchmaking-Error]', err.message);
+        console.error('[Match-Error]', err.message);
     }
 }
 
@@ -111,11 +88,11 @@ function processEnglishMatchmaking() {
     const advancedPool = queues.ENGLISH_ADVANCED;
     const now = Date.now();
 
-    // Priority 1: Direct Same-Tier Pairing
-    executeEnglishPairing(beginnerPool);
-    executeEnglishPairing(advancedPool);
+    // Priority 1: Same-Tier Pairing
+    processQueuePairing(beginnerPool, true);
+    processQueuePairing(advancedPool, true);
 
-    // Priority 2: Cross-Tier Fallback for users waiting >= 5 seconds
+    // Priority 2: Cross-Tier Fallback after 5s
     if (beginnerPool.length > 0 && advancedPool.length > 0) {
         const waitingBeginnerIdx = beginnerPool.findIndex(u => (now - u.joinedAt) >= 5000);
         const waitingAdvancedIdx = advancedPool.findIndex(u => (now - u.joinedAt) >= 5000);
@@ -123,13 +100,12 @@ function processEnglishMatchmaking() {
         if (waitingBeginnerIdx !== -1 && waitingAdvancedIdx !== -1) {
             const userA = beginnerPool.splice(waitingBeginnerIdx, 1)[0];
             const userB = advancedPool.splice(waitingAdvancedIdx, 1)[0];
-
             createCallPair(userA, userB);
         }
     }
 }
 
-function executeEnglishPairing(pool) {
+function processQueuePairing(pool, isEnglish = false) {
     if (pool.length < 2) return;
     const now = Date.now();
 
@@ -141,39 +117,13 @@ function executeEnglishPairing(pool) {
             const userB = pool[j];
             if (!userB) continue;
 
-            // VIP Female Filter matching logic (English only)
-            if (userA.talkToFemaleOnly && userB.userGender !== 'Female') continue;
-            if (userB.talkToFemaleOnly && userA.userGender !== 'Female') continue;
-
-            // Anti-repeat soft check: skip if recent partner unless waiting > 7s or pool is small
-            const hasRecent = recentPartners.get(userA.socketId)?.has(userB.socketId);
-            const isWaitingLong = (now - userA.joinedAt) > 7000 || (now - userB.joinedAt) > 7000;
-
-            if (hasRecent && !isWaitingLong && pool.length > 2) {
-                continue;
+            // VIP Female filter (English only)
+            if (isEnglish) {
+                if (userA.talkToFemaleOnly && userB.userGender !== 'Female') continue;
+                if (userB.talkToFemaleOnly && userA.userGender !== 'Female') continue;
             }
 
-            // Match found: Pop both atomically
-            pool.splice(j, 1);
-            pool.splice(i, 1);
-            createCallPair(userA, userB);
-            return executeEnglishPairing(pool);
-        }
-    }
-}
-
-function processRegionalPairing(pool) {
-    if (pool.length < 2) return;
-    const now = Date.now();
-
-    for (let i = 0; i < pool.length; i++) {
-        const userA = pool[i];
-        if (!userA) continue;
-
-        for (let j = i + 1; j < pool.length; j++) {
-            const userB = pool[j];
-            if (!userB) continue;
-
+            // Soft anti-repeat
             const hasRecent = recentPartners.get(userA.socketId)?.has(userB.socketId);
             const isWaitingLong = (now - userA.joinedAt) > 7000 || (now - userB.joinedAt) > 7000;
 
@@ -184,7 +134,7 @@ function processRegionalPairing(pool) {
             pool.splice(j, 1);
             pool.splice(i, 1);
             createCallPair(userA, userB);
-            return processRegionalPairing(pool);
+            return processQueuePairing(pool, isEnglish);
         }
     }
 }
@@ -193,7 +143,6 @@ function createCallPair(userA, userB) {
     const sockA = activeSockets.get(userA.socketId);
     const sockB = activeSockets.get(userB.socketId);
 
-    // Validate both sockets are live before dispatching
     if (!sockA || sockA.readyState !== WebSocket.OPEN || !sockB || sockB.readyState !== WebSocket.OPEN) {
         if (sockA && sockA.readyState === WebSocket.OPEN) queues[userA.queueKey].unshift(userA);
         if (sockB && sockB.readyState === WebSocket.OPEN) queues[userB.queueKey].unshift(userB);
@@ -207,7 +156,7 @@ function createCallPair(userA, userB) {
 
     recordRecentPartner(userA.socketId, userB.socketId);
 
-    console.log(`[Match-Found] ${userA.socketId} <-> ${userB.socketId} in Room: ${roomId}`);
+    console.log(`[Match-Found] ${userA.socketId} <--> ${userB.socketId} in Room: ${roomId}`);
 
     try {
         sockA.send(JSON.stringify({
@@ -228,7 +177,7 @@ function createCallPair(userA, userB) {
             isReconnect: false
         }));
     } catch (e) {
-        console.error('[Dispatch-Error]', e.message);
+        console.error('[Dispatch-ERR]', e.message);
     }
 }
 
@@ -246,24 +195,28 @@ function recordRecentPartner(idA, idB) {
 }
 
 // ----------------------------------------------------
-// WEBSOCKET SIGNALING CONNECTION ROUTING
+// SIGNALING ROUTING
 // ----------------------------------------------------
 
 wss.on('connection', (ws) => {
     const socketId = 'user_' + Math.random().toString(36).substring(2, 10);
     ws.socketId = socketId;
-
     activeSockets.set(socketId, ws);
     console.log(`[Client-Connected] Socket ID: ${socketId}`);
 
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
+            const msgType = data.type || data.action || '';
 
-            switch (data.type) {
-                case 'join_queue': {
+            switch (msgType) {
+                // Support all queue join aliases
+                case 'join_queue':
+                case 'search':
+                case 'find_match':
+                case 'join': {
                     removeFromAllQueues(socketId);
-                    const lang = data.language || 'ENGLISH';
+                    const lang = (data.language || 'ENGLISH').toUpperCase();
                     let queueKey = lang;
 
                     if (lang === 'ENGLISH') {
@@ -276,25 +229,30 @@ wss.on('connection', (ws) => {
                             level: data.level || 'Beginner',
                             language: lang,
                             queueKey: queueKey,
-                            userGender: data.userGender || 'Unknown',
-                            talkToFemaleOnly: data.talkToFemaleOnly === true,
+                            userGender: data.userGender || data.gender || 'Unknown',
+                            talkToFemaleOnly: data.talkToFemaleOnly === true || data.femaleOnly === true,
                             isVip: data.isVip === true,
                             joinedAt: Date.now()
                         });
-                        console.log(`[Queue-Joined] ${socketId} joined ${queueKey} (Total in pool: ${queues[queueKey].length})`);
+                        console.log(`[Queue-Joined] ${socketId} searching for Level: ${data.level || 'Beginner'}, Language: ${lang} (Pool: ${queues[queueKey].length})`);
                         matchUsers();
                     }
                     break;
                 }
 
-                case 'leave_queue': {
+                // Support all cancel/leave queue aliases
+                case 'leave_queue':
+                case 'cancel_search':
+                case 'cancel': {
                     removeFromAllQueues(socketId);
-                    console.log(`[Queue-Left] ${socketId} left queue`);
+                    console.log(`[Queue-Left] ${socketId} cancelled search`);
                     break;
                 }
 
-                case 'request_reconnect': {
-                    const targetPeerId = data.targetPeerId;
+                // Support reconnect aliases
+                case 'request_reconnect':
+                case 'reconnect': {
+                    const targetPeerId = data.targetPeerId || data.targetPeer;
                     const targetSock = activeSockets.get(targetPeerId);
 
                     if (!targetSock || targetSock.readyState !== WebSocket.OPEN || activeCalls.has(targetPeerId)) {
@@ -370,7 +328,7 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (err) {
-            console.error('[Signaling-Message-Error]', err.message);
+            console.error('[Message-ERR]', err.message);
         }
     });
 
