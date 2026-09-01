@@ -42,7 +42,7 @@ function removeFromAllQueues(socketId) {
     }
 }
 
-// Gentle keep-alive ping for cloud hosting
+// Keep-alive TCP Ping every 25s
 setInterval(() => {
     for (const [id, sock] of activeSockets.entries()) {
         if (sock.readyState === WebSocket.OPEN) {
@@ -54,7 +54,12 @@ setInterval(() => {
             removeFromAllQueues(id);
         }
     }
-}, 30000);
+}, 25000);
+
+// Continuous Match Loop (Runs every 1 second to pair waiting users)
+setInterval(() => {
+    matchUsers();
+}, 1000);
 
 // ----------------------------------------------------
 // MATCHMAKING CORE
@@ -62,7 +67,7 @@ setInterval(() => {
 
 function matchUsers() {
     try {
-        // 1. Regional Pools (12 Languages - Isolated)
+        // 1. Regional Pools (12 Languages - Strictly Isolated)
         const regionalPools = [
             'HINDI', 'PUNJABI', 'MARATHI', 'BENGALI', 'BHOJPURI',
             'GUJARATI', 'KANNADA', 'MALAYALAM', 'TAMIL', 'TELUGU',
@@ -72,7 +77,7 @@ function matchUsers() {
         for (const lang of regionalPools) {
             const pool = queues[lang];
             if (pool && pool.length >= 2) {
-                processQueuePairing(pool);
+                processQueuePairing(pool, false);
             }
         }
 
@@ -158,24 +163,27 @@ function createCallPair(userA, userB) {
 
     console.log(`[Match-Found] ${userA.socketId} <--> ${userB.socketId} in Room: ${roomId}`);
 
-    try {
-        sockA.send(JSON.stringify({
-            type: 'match_found',
-            roomId: roomId,
-            isInitiator: true,
-            peerLevel: userB.level || 'Peer',
-            peerId: userB.socketId,
-            isReconnect: false
-        }));
+    const matchPayloadA = JSON.stringify({
+        type: 'match_found',
+        roomId: roomId,
+        isInitiator: true,
+        peerLevel: userB.level || 'Peer',
+        peerId: userB.socketId,
+        isReconnect: false
+    });
 
-        sockB.send(JSON.stringify({
-            type: 'match_found',
-            roomId: roomId,
-            isInitiator: false,
-            peerLevel: userA.level || 'Peer',
-            peerId: userA.socketId,
-            isReconnect: false
-        }));
+    const matchPayloadB = JSON.stringify({
+        type: 'match_found',
+        roomId: roomId,
+        isInitiator: false,
+        peerLevel: userA.level || 'Peer',
+        peerId: userA.socketId,
+        isReconnect: false
+    });
+
+    try {
+        sockA.send(matchPayloadA);
+        sockB.send(matchPayloadB);
     } catch (e) {
         console.error('[Dispatch-ERR]', e.message);
     }
@@ -195,7 +203,7 @@ function recordRecentPartner(idA, idB) {
 }
 
 // ----------------------------------------------------
-// SIGNALING ROUTING
+// SIGNALING & MESSAGE PARSING
 // ----------------------------------------------------
 
 wss.on('connection', (ws) => {
@@ -206,11 +214,12 @@ wss.on('connection', (ws) => {
 
     ws.on('message', (message) => {
         try {
-            const data = JSON.parse(message);
-            const msgType = data.type || data.action || '';
+            // Explicit UTF-8 string conversion for Node.js 24 compatibility
+            const messageStr = typeof message === 'string' ? message : message.toString('utf8');
+            const data = JSON.parse(messageStr);
+            const msgType = (data.type || data.event || data.action || data.command || '').toLowerCase();
 
             switch (msgType) {
-                // Support all queue join aliases
                 case 'join_queue':
                 case 'search':
                 case 'find_match':
@@ -234,22 +243,20 @@ wss.on('connection', (ws) => {
                             isVip: data.isVip === true,
                             joinedAt: Date.now()
                         });
-                        console.log(`[Queue-Joined] ${socketId} searching for Level: ${data.level || 'Beginner'}, Language: ${lang} (Pool: ${queues[queueKey].length})`);
+                        console.log(`[Queue-Joined] ${socketId} in ${queueKey} (Total: ${queues[queueKey].length})`);
                         matchUsers();
                     }
                     break;
                 }
 
-                // Support all cancel/leave queue aliases
                 case 'leave_queue':
                 case 'cancel_search':
                 case 'cancel': {
                     removeFromAllQueues(socketId);
-                    console.log(`[Queue-Left] ${socketId} cancelled search`);
+                    console.log(`[Queue-Left] ${socketId}`);
                     break;
                 }
 
-                // Support reconnect aliases
                 case 'request_reconnect':
                 case 'reconnect': {
                     const targetPeerId = data.targetPeerId || data.targetPeer;
@@ -303,18 +310,20 @@ wss.on('connection', (ws) => {
 
                 case 'offer':
                 case 'answer':
-                case 'ice_candidate': {
+                case 'ice_candidate':
+                case 'candidate': {
                     const callInfo = activeCalls.get(socketId);
                     if (callInfo && callInfo.partnerId) {
                         const partnerSock = activeSockets.get(callInfo.partnerId);
                         if (partnerSock && partnerSock.readyState === WebSocket.OPEN) {
-                            partnerSock.send(JSON.stringify(data));
+                            partnerSock.send(messageStr);
                         }
                     }
                     break;
                 }
 
-                case 'end_call': {
+                case 'end_call':
+                case 'hangup': {
                     const callInfo = activeCalls.get(socketId);
                     if (callInfo && callInfo.partnerId) {
                         const partnerSock = activeSockets.get(callInfo.partnerId);
@@ -328,7 +337,7 @@ wss.on('connection', (ws) => {
                 }
             }
         } catch (err) {
-            console.error('[Message-ERR]', err.message);
+            console.error('[Message-Parse-ERR]', err.message);
         }
     });
 
