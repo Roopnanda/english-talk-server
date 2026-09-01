@@ -38,11 +38,15 @@ function generateRoomId() {
 
 function removeFromAllQueues(socketId) {
     for (const key of Object.keys(queues)) {
+        const prevLen = queues[key].length;
         queues[key] = queues[key].filter(entry => entry.socketId !== socketId);
+        if (queues[key].length !== prevLen) {
+            console.log(`[Queue-Purge] Removed ${socketId} from ${key}`);
+        }
     }
 }
 
-// Keep-alive TCP Ping every 25s
+// Gentle keep-alive ping
 setInterval(() => {
     for (const [id, sock] of activeSockets.entries()) {
         if (sock.readyState === WebSocket.OPEN) {
@@ -56,18 +60,18 @@ setInterval(() => {
     }
 }, 25000);
 
-// Continuous Match Loop (Runs every 1 second to pair waiting users)
+// Continuous Match Loop (Runs every 1 second)
 setInterval(() => {
     matchUsers();
 }, 1000);
 
 // ----------------------------------------------------
-// MATCHMAKING CORE
+// MATCHMAKING ENGINE
 // ----------------------------------------------------
 
 function matchUsers() {
     try {
-        // 1. Regional Pools (12 Languages - Strictly Isolated)
+        // 1. 12 Isolated Regional Pools
         const regionalPools = [
             'HINDI', 'PUNJABI', 'MARATHI', 'BENGALI', 'BHOJPURI',
             'GUJARATI', 'KANNADA', 'MALAYALAM', 'TAMIL', 'TELUGU',
@@ -81,7 +85,7 @@ function matchUsers() {
             }
         }
 
-        // 2. English Pools (Beginner & Advanced with 5s fallback)
+        // 2. English Pools
         processEnglishMatchmaking();
     } catch (err) {
         console.error('[Match-Error]', err.message);
@@ -122,13 +126,11 @@ function processQueuePairing(pool, isEnglish = false) {
             const userB = pool[j];
             if (!userB) continue;
 
-            // VIP Female filter (English only)
             if (isEnglish) {
                 if (userA.talkToFemaleOnly && userB.userGender !== 'Female') continue;
                 if (userB.talkToFemaleOnly && userA.userGender !== 'Female') continue;
             }
 
-            // Soft anti-repeat
             const hasRecent = recentPartners.get(userA.socketId)?.has(userB.socketId);
             const isWaitingLong = (now - userA.joinedAt) > 7000 || (now - userB.joinedAt) > 7000;
 
@@ -161,9 +163,9 @@ function createCallPair(userA, userB) {
 
     recordRecentPartner(userA.socketId, userB.socketId);
 
-    console.log(`[Match-Found] ${userA.socketId} <--> ${userB.socketId} in Room: ${roomId}`);
+    console.log(`[MATCH SUCCESS] ${userA.socketId} paired with ${userB.socketId} in Room: ${roomId}`);
 
-    const matchPayloadA = JSON.stringify({
+    const payloadA = JSON.stringify({
         type: 'match_found',
         roomId: roomId,
         isInitiator: true,
@@ -172,7 +174,7 @@ function createCallPair(userA, userB) {
         isReconnect: false
     });
 
-    const matchPayloadB = JSON.stringify({
+    const payloadB = JSON.stringify({
         type: 'match_found',
         roomId: roomId,
         isInitiator: false,
@@ -182,8 +184,8 @@ function createCallPair(userA, userB) {
     });
 
     try {
-        sockA.send(matchPayloadA);
-        sockB.send(matchPayloadB);
+        sockA.send(payloadA);
+        sockB.send(payloadB);
     } catch (e) {
         console.error('[Dispatch-ERR]', e.message);
     }
@@ -203,21 +205,20 @@ function recordRecentPartner(idA, idB) {
 }
 
 // ----------------------------------------------------
-// SIGNALING & MESSAGE PARSING
+// SIGNALING MESSAGE ROUTING
 // ----------------------------------------------------
 
 wss.on('connection', (ws) => {
     const socketId = 'user_' + Math.random().toString(36).substring(2, 10);
     ws.socketId = socketId;
     activeSockets.set(socketId, ws);
-    console.log(`[Client-Connected] Socket ID: ${socketId}`);
+    console.log(`[Client-Connected] ${socketId}`);
 
     ws.on('message', (message) => {
         try {
-            // Explicit UTF-8 string conversion for Node.js 24 compatibility
             const messageStr = typeof message === 'string' ? message : message.toString('utf8');
             const data = JSON.parse(messageStr);
-            const msgType = (data.type || data.event || data.action || data.command || '').toLowerCase();
+            const msgType = (data.type || data.event || data.action || '').toLowerCase();
 
             switch (msgType) {
                 case 'join_queue':
@@ -243,7 +244,7 @@ wss.on('connection', (ws) => {
                             isVip: data.isVip === true,
                             joinedAt: Date.now()
                         });
-                        console.log(`[Queue-Joined] ${socketId} in ${queueKey} (Total: ${queues[queueKey].length})`);
+                        console.log(`[Queue-Joined] ${socketId} joined ${queueKey} (Total in pool: ${queues[queueKey].length})`);
                         matchUsers();
                     }
                     break;
