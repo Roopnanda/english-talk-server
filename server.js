@@ -32,6 +32,12 @@ const activeCalls = new Map();
 const recentPartners = new Map();
 const reconnectRequests = new Map();
 
+// Report Moderation Maps:
+// reportHistory: reportedPeerId -> Array of timestamps [t1, t2, ...]
+const reportHistory = new Map();
+// serverCooldowns: socketId/targetId -> cooldownExpiryTimestamp
+const serverCooldowns = new Map();
+
 function generateRoomId() {
     return 'room_' + Math.random().toString(36).substring(2, 10);
 }
@@ -46,7 +52,7 @@ function removeFromAllQueues(socketId) {
     }
 }
 
-// Gentle keep-alive ping
+// Keep-alive TCP Ping every 25s
 setInterval(() => {
     for (const [id, sock] of activeSockets.entries()) {
         if (sock.readyState === WebSocket.OPEN) {
@@ -66,7 +72,7 @@ setInterval(() => {
 }, 1000);
 
 // ----------------------------------------------------
-// MATCHMAKING ENGINE
+// MATCHMAKING CORE
 // ----------------------------------------------------
 
 function matchUsers() {
@@ -85,7 +91,7 @@ function matchUsers() {
             }
         }
 
-        // 2. English Pools
+        // 2. English Pools (Beginner & Advanced with 5s fallback)
         processEnglishMatchmaking();
     } catch (err) {
         console.error('[Match-Error]', err.message);
@@ -126,11 +132,13 @@ function processQueuePairing(pool, isEnglish = false) {
             const userB = pool[j];
             if (!userB) continue;
 
+            // VIP Female filter (English only)
             if (isEnglish) {
                 if (userA.talkToFemaleOnly && userB.userGender !== 'Female') continue;
                 if (userB.talkToFemaleOnly && userA.userGender !== 'Female') continue;
             }
 
+            // Soft anti-repeat
             const hasRecent = recentPartners.get(userA.socketId)?.has(userB.socketId);
             const isWaitingLong = (now - userA.joinedAt) > 7000 || (now - userB.joinedAt) > 7000;
 
@@ -205,7 +213,7 @@ function recordRecentPartner(idA, idB) {
 }
 
 // ----------------------------------------------------
-// SIGNALING MESSAGE ROUTING
+// SIGNALING & MESSAGE ROUTING
 // ----------------------------------------------------
 
 wss.on('connection', (ws) => {
@@ -218,13 +226,25 @@ wss.on('connection', (ws) => {
         try {
             const messageStr = typeof message === 'string' ? message : message.toString('utf8');
             const data = JSON.parse(messageStr);
-            const msgType = (data.type || data.event || data.action || '').toLowerCase();
+            const msgType = (data.type || data.event || data.action || data.command || '').toLowerCase();
 
             switch (msgType) {
                 case 'join_queue':
                 case 'search':
                 case 'find_match':
                 case 'join': {
+                    const now = Date.now();
+                    const activeCooldown = serverCooldowns.get(socketId);
+                    if (activeCooldown && activeCooldown > now) {
+                        const remainingSec = Math.ceil((activeCooldown - now) / 1000);
+                        ws.send(JSON.stringify({
+                            type: 'cooldown_active',
+                            reason: 'community_reports',
+                            remainingSeconds: remainingSec
+                        }));
+                        return;
+                    }
+
                     removeFromAllQueues(socketId);
                     const lang = (data.language || 'ENGLISH').toUpperCase();
                     let queueKey = lang;
@@ -244,8 +264,39 @@ wss.on('connection', (ws) => {
                             isVip: data.isVip === true,
                             joinedAt: Date.now()
                         });
-                        console.log(`[Queue-Joined] ${socketId} joined ${queueKey} (Total in pool: ${queues[queueKey].length})`);
+                        console.log(`[Queue-Joined] ${socketId} in ${queueKey} (Total: ${queues[queueKey].length})`);
                         matchUsers();
+                    }
+                    break;
+                }
+
+                case 'report_user': {
+                    const reportedPeerId = data.reportedPeerId;
+                    if (!reportedPeerId) return;
+
+                    const now = Date.now();
+                    const history = reportHistory.get(reportedPeerId) || [];
+                    // Keep timestamps within the last 1 hour
+                    const recent = history.filter(ts => (now - ts) < 60 * 60 * 1000);
+                    recent.push(now);
+                    reportHistory.set(reportedPeerId, recent);
+
+                    console.log(`[User-Reported] ${reportedPeerId} has ${recent.length} report(s) in the last hour`);
+
+                    // 10 reports in 1 hour -> 3 minute cooldown (180,000 ms)
+                    if (recent.length >= 10) {
+                        const expiry = now + 3 * 60 * 1000;
+                        serverCooldowns.set(reportedPeerId, expiry);
+                        console.log(`[Penalty-Applied] ${reportedPeerId} locked on 3-min cooldown`);
+
+                        const reportedSock = activeSockets.get(reportedPeerId);
+                        if (reportedSock && reportedSock.readyState === WebSocket.OPEN) {
+                            reportedSock.send(JSON.stringify({
+                                type: 'cooldown_active',
+                                reason: 'community_reports',
+                                remainingSeconds: 180
+                            }));
+                        }
                     }
                     break;
                 }
