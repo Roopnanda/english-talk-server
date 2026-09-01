@@ -55,34 +55,29 @@ function removeFromAllQueues(socketId) {
     }
 }
 
-// Heartbeat: Keeps TCP connection alive and cleans dead queue entries
+// Safe Heartbeat: Keep TCP alive across Render without aggressive termination
 const heartbeatInterval = setInterval(() => {
-    // 1. Keep alive ping to active sockets
     for (const [id, sock] of activeSockets.entries()) {
         if (sock.readyState === WebSocket.OPEN) {
-            if (sock.isAlive === false) {
-                console.log(`[Heartbeat] Terminating inactive socket: ${id}`);
-                sock.terminate();
-                activeSockets.delete(id);
-                removeFromAllQueues(id);
-            } else {
-                sock.isAlive = false;
+            try {
                 sock.ping(() => {});
+            } catch (e) {
+                // Ignore ping dispatch errors
             }
-        } else {
+        } else if (sock.readyState === WebSocket.CLOSED || sock.readyState === WebSocket.CLOSING) {
             activeSockets.delete(id);
             removeFromAllQueues(id);
         }
     }
 
-    // 2. Clear closed sockets from queues
+    // Clean stale queues
     for (const key of Object.keys(queues)) {
         queues[key] = queues[key].filter(entry => {
             const client = activeSockets.get(entry.socketId);
             return client && client.readyState === WebSocket.OPEN;
         });
     }
-}, 20000);
+}, 25000);
 
 // ----------------------------------------------------
 // MATCHMAKING ENGINE
@@ -135,6 +130,7 @@ function processEnglishMatchmaking() {
 }
 
 function executeEnglishPairing(pool) {
+    if (pool.length < 2) return;
     const now = Date.now();
 
     for (let i = 0; i < pool.length; i++) {
@@ -167,6 +163,7 @@ function executeEnglishPairing(pool) {
 }
 
 function processRegionalPairing(pool) {
+    if (pool.length < 2) return;
     const now = Date.now();
 
     for (let i = 0; i < pool.length; i++) {
@@ -254,12 +251,7 @@ function recordRecentPartner(idA, idB) {
 
 wss.on('connection', (ws) => {
     const socketId = 'user_' + Math.random().toString(36).substring(2, 10);
-    ws.isAlive = true;
     ws.socketId = socketId;
-
-    ws.on('pong', () => {
-        ws.isAlive = true;
-    });
 
     activeSockets.set(socketId, ws);
     console.log(`[Client-Connected] Socket ID: ${socketId}`);
