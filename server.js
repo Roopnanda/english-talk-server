@@ -3,7 +3,6 @@ const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// HTTP Health Check Server required by Render
 const server = http.createServer((req, res) => {
     if (req.url === '/' || req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -16,7 +15,7 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// Queue Pools
+// Queues
 const queues = {
     english: {
         Beginner: [],
@@ -27,11 +26,11 @@ const queues = {
 };
 
 // State Maps
-const activeRooms = new Map();         // roomId -> { user1, user2 }
-const recentPartners = new Map();      // userId -> { partnerId, timestamp }
-const reportRecords = new Map();       // userId -> [ { reason, timestamp } ]
-const femaleConsecutiveVip = new Map();// userId -> count
-const reconnectRequests = new Map();   // targetUserId -> { requesterWs, level }
+const activeRooms = new Map();
+const recentPartners = new Map();
+const reportRecords = new Map();
+const femaleConsecutiveVip = new Map();
+const pendingReconnects = new Map(); // pairKey -> { userA, userB, level }
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -41,14 +40,13 @@ function getSafeUserId(ws) {
     return ws.userId || (ws._socket && ws._socket.remoteAddress ? ws._socket.remoteAddress + ":" + ws._socket.remotePort : "unknown");
 }
 
-// Rule 22: Smart Anti-Repeat with 7-Second Fallback
 function isEligiblePair(itemA, itemB) {
     const now = Date.now();
     const waitA = now - (itemA.joinedAt || now);
     const waitB = now - (itemB.joinedAt || now);
 
-    // If either user has been waiting for more than 7 seconds, relax anti-repeat
-    if (waitA >= 7000 || waitB >= 7000) {
+    // Rule 22 Fallback: If either user has been in queue for >= 3 seconds, bypass anti-repeat
+    if (waitA >= 3000 || waitB >= 3000) {
         return true;
     }
 
@@ -109,8 +107,10 @@ function removeFromAllQueues(ws) {
         queues.regional[lang] = queues.regional[lang].filter(item => item.ws !== ws);
     }
     const myId = getSafeUserId(ws);
-    if (reconnectRequests.has(myId)) {
-        reconnectRequests.delete(myId);
+    for (const [key, obj] of pendingReconnects.entries()) {
+        if (obj.requesterId === myId) {
+            pendingReconnects.delete(key);
+        }
     }
 }
 
@@ -183,8 +183,15 @@ function tryRegionalMatch(lang) {
     }
 }
 
-// Rule 10: 5-Second Cross-Level Fallback Checker
+// Continuous Match Sweeper: runs every 1 second across all queues
 setInterval(() => {
+    tryEnglishMatch("Beginner");
+    tryEnglishMatch("Advanced");
+    for (const lang in queues.regional) {
+        tryRegionalMatch(lang);
+    }
+
+    // Rule 10: 5-Second Cross-Level Fallback
     const now = Date.now();
     const beg = queues.english.Beginner;
     const adv = queues.english.Advanced;
@@ -205,7 +212,7 @@ setInterval(() => {
             }
         }
     }
-}, 2000);
+}, 1000);
 
 // Rule 23: Ghost socket purger (every 25 seconds)
 setInterval(() => {
@@ -266,36 +273,31 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 12: Direct Reconnect Handshake
+                // Rule 12: Symmetric Mutual Reconnect
                 case 'request_reconnect': {
                     removeFromAllQueues(ws);
+                    const requesterId = getSafeUserId(ws);
                     const targetId = data.targetPeerId;
                     const level = data.level || "Beginner";
-                    const requesterId = getSafeUserId(ws);
 
                     log("RECONNECT", `${requesterId} requesting reconnect to ${targetId}`);
 
-                    // Check if target is online
-                    let targetWs = null;
-                    wss.clients.forEach(client => {
-                        if (getSafeUserId(client) === targetId && client.readyState === WebSocket.OPEN) {
-                            targetWs = client;
+                    const pairKey = [requesterId, targetId].sort().join("<->");
+                    const existing = pendingReconnects.get(pairKey);
+
+                    if (existing && existing.requesterId !== requesterId) {
+                        // The other peer already requested! Match them immediately
+                        const otherWs = existing.ws;
+                        pendingReconnects.delete(pairKey);
+
+                        if (otherWs.readyState === WebSocket.OPEN && !otherWs.inCall) {
+                            createMatch(ws, otherWs, level, "ENGLISH", true);
+                        } else {
+                            ws.send(JSON.stringify({ type: 'reconnect_failed', reason: 'offline_or_busy' }));
                         }
-                    });
-
-                    if (!targetWs || targetWs.inCall) {
-                        ws.send(JSON.stringify({ type: 'reconnect_failed', reason: 'offline_or_busy' }));
-                        return;
-                    }
-
-                    // Check if target already requested reconnect back to this user (Mutual Handshake)
-                    const pending = reconnectRequests.get(requesterId);
-                    if (pending && getSafeUserId(pending.requesterWs) === targetId) {
-                        reconnectRequests.delete(requesterId);
-                        createMatch(ws, targetWs, level, "ENGLISH", true);
                     } else {
-                        // Store pending request and notify requester to wait
-                        reconnectRequests.set(targetId, { requesterWs: ws, level: level });
+                        // Save this request and notify client to wait
+                        pendingReconnects.set(pairKey, { requesterId: requesterId, ws: ws, level: level });
                         ws.send(JSON.stringify({ type: 'reconnect_waiting' }));
                     }
                     break;
@@ -303,9 +305,9 @@ wss.on('connection', (ws, req) => {
 
                 case 'cancel_reconnect': {
                     const myId = getSafeUserId(ws);
-                    for (const [target, record] of reconnectRequests.entries()) {
-                        if (getSafeUserId(record.requesterWs) === myId) {
-                            reconnectRequests.delete(target);
+                    for (const [key, obj] of pendingReconnects.entries()) {
+                        if (obj.requesterId === myId) {
+                            pendingReconnects.delete(key);
                         }
                     }
                     break;
