@@ -27,10 +27,11 @@ const queues = {
 };
 
 // State Maps
-const activeRooms = new Map();
-const recentPartners = new Map();
-const reportRecords = new Map();
-const femaleConsecutiveVip = new Map();
+const activeRooms = new Map();         // roomId -> { user1, user2 }
+const recentPartners = new Map();      // userId -> { partnerId, timestamp }
+const reportRecords = new Map();       // userId -> [ { reason, timestamp } ]
+const femaleConsecutiveVip = new Map();// userId -> count
+const reconnectRequests = new Map();   // targetUserId -> { requesterWs, level }
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -40,12 +41,21 @@ function getSafeUserId(ws) {
     return ws.userId || (ws._socket && ws._socket.remoteAddress ? ws._socket.remoteAddress + ":" + ws._socket.remotePort : "unknown");
 }
 
-function isEligiblePair(userA, userB) {
+// Rule 22: Smart Anti-Repeat with 7-Second Fallback
+function isEligiblePair(itemA, itemB) {
     const now = Date.now();
-    const idA = getSafeUserId(userA);
-    const idB = getSafeUserId(userB);
+    const waitA = now - (itemA.joinedAt || now);
+    const waitB = now - (itemB.joinedAt || now);
 
+    // If either user has been waiting for more than 7 seconds, relax anti-repeat
+    if (waitA >= 7000 || waitB >= 7000) {
+        return true;
+    }
+
+    const idA = getSafeUserId(itemA.ws);
+    const idB = getSafeUserId(itemB.ws);
     const prevA = recentPartners.get(idA);
+
     if (prevA && prevA.partnerId === idB && (now - prevA.timestamp) < 300000) {
         return false;
     }
@@ -87,7 +97,7 @@ function createMatch(userA, userB, level, language, isReconnect = false) {
         isReconnect: isReconnect
     }));
 
-    log("MATCH", `Paired ${idA} and ${idB} in Room: ${roomId} [${language} - ${level}]`);
+    log("MATCH", `Paired ${idA} and ${idB} in Room: ${roomId} [${language} - ${level}] (Reconnect: ${isReconnect})`);
 }
 
 function removeFromAllQueues(ws) {
@@ -98,6 +108,10 @@ function removeFromAllQueues(ws) {
     for (const lang in queues.regional) {
         queues.regional[lang] = queues.regional[lang].filter(item => item.ws !== ws);
     }
+    const myId = getSafeUserId(ws);
+    if (reconnectRequests.has(myId)) {
+        reconnectRequests.delete(myId);
+    }
 }
 
 function tryEnglishMatch(level) {
@@ -106,14 +120,14 @@ function tryEnglishMatch(level) {
 
     for (let i = 0; i < queue.length; i++) {
         for (let j = i + 1; j < queue.length; j++) {
-            const userA = queue[i].ws;
-            const userB = queue[j].ws;
+            const itemA = queue[i];
+            const itemB = queue[j];
 
-            if (userA.readyState === WebSocket.OPEN && userB.readyState === WebSocket.OPEN) {
-                if (isEligiblePair(userA, userB)) {
+            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN) {
+                if (isEligiblePair(itemA, itemB)) {
                     queue.splice(j, 1);
                     queue.splice(i, 1);
-                    createMatch(userA, userB, level, "ENGLISH");
+                    createMatch(itemA.ws, itemB.ws, level, "ENGLISH");
                     return;
                 }
             }
@@ -126,7 +140,7 @@ function handleFemaleMatchmaking(femaleWs, level) {
     const consecutiveVip = femaleConsecutiveVip.get(femaleId) || 0;
 
     if (consecutiveVip >= 2) {
-        log("BREATHER", `Female ${femaleId} hit 2 consecutive VIP calls. Routing to general queue.`);
+        log("BREATHER", `Female ${femaleId} hit 2 consecutive VIP calls. Routing to general.`);
         femaleConsecutiveVip.set(femaleId, 0);
         queues.english[level].push({ ws: femaleWs, joinedAt: Date.now() });
         tryEnglishMatch(level);
@@ -137,7 +151,7 @@ function handleFemaleMatchmaking(femaleWs, level) {
         const vipItem = queues.vipFemale.shift();
         const vipWs = vipItem.ws;
 
-        if (vipWs.readyState === WebSocket.OPEN && isEligiblePair(femaleWs, vipWs)) {
+        if (vipWs.readyState === WebSocket.OPEN && isEligiblePair({ ws: femaleWs, joinedAt: Date.now() }, vipItem)) {
             femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
             createMatch(vipWs, femaleWs, level, "ENGLISH");
             return;
@@ -154,14 +168,14 @@ function tryRegionalMatch(lang) {
 
     for (let i = 0; i < queue.length; i++) {
         for (let j = i + 1; j < queue.length; j++) {
-            const userA = queue[i].ws;
-            const userB = queue[j].ws;
+            const itemA = queue[i];
+            const itemB = queue[j];
 
-            if (userA.readyState === WebSocket.OPEN && userB.readyState === WebSocket.OPEN) {
-                if (isEligiblePair(userA, userB)) {
+            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN) {
+                if (isEligiblePair(itemA, itemB)) {
                     queue.splice(j, 1);
                     queue.splice(i, 1);
-                    createMatch(userA, userB, "Native", lang);
+                    createMatch(itemA.ws, itemB.ws, "Native", lang);
                     return;
                 }
             }
@@ -169,7 +183,7 @@ function tryRegionalMatch(lang) {
     }
 }
 
-// Cross-Level Fallback (Rule 10)
+// Rule 10: 5-Second Cross-Level Fallback Checker
 setInterval(() => {
     const now = Date.now();
     const beg = queues.english.Beginner;
@@ -179,12 +193,12 @@ setInterval(() => {
         if (now - beg[i].joinedAt >= 5000) {
             for (let j = 0; j < adv.length; j++) {
                 if (now - adv[j].joinedAt >= 5000) {
-                    const userA = beg[i].ws;
-                    const userB = adv[j].ws;
-                    if (isEligiblePair(userA, userB)) {
+                    const itemA = beg[i];
+                    const itemB = adv[j];
+                    if (isEligiblePair(itemA, itemB)) {
                         beg.splice(i, 1);
                         adv.splice(j, 1);
-                        createMatch(userA, userB, "General", "ENGLISH");
+                        createMatch(itemA.ws, itemB.ws, "General", "ENGLISH");
                         return;
                     }
                 }
@@ -193,7 +207,7 @@ setInterval(() => {
     }
 }, 2000);
 
-// Ghost socket purger (Rule 23)
+// Rule 23: Ghost socket purger (every 25 seconds)
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
@@ -249,6 +263,51 @@ wss.on('connection', (ws, req) => {
                 case 'leave_queue': {
                     removeFromAllQueues(ws);
                     log("QUEUE", `User ${ws.userId} left queue`);
+                    break;
+                }
+
+                // Rule 12: Direct Reconnect Handshake
+                case 'request_reconnect': {
+                    removeFromAllQueues(ws);
+                    const targetId = data.targetPeerId;
+                    const level = data.level || "Beginner";
+                    const requesterId = getSafeUserId(ws);
+
+                    log("RECONNECT", `${requesterId} requesting reconnect to ${targetId}`);
+
+                    // Check if target is online
+                    let targetWs = null;
+                    wss.clients.forEach(client => {
+                        if (getSafeUserId(client) === targetId && client.readyState === WebSocket.OPEN) {
+                            targetWs = client;
+                        }
+                    });
+
+                    if (!targetWs || targetWs.inCall) {
+                        ws.send(JSON.stringify({ type: 'reconnect_failed', reason: 'offline_or_busy' }));
+                        return;
+                    }
+
+                    // Check if target already requested reconnect back to this user (Mutual Handshake)
+                    const pending = reconnectRequests.get(requesterId);
+                    if (pending && getSafeUserId(pending.requesterWs) === targetId) {
+                        reconnectRequests.delete(requesterId);
+                        createMatch(ws, targetWs, level, "ENGLISH", true);
+                    } else {
+                        // Store pending request and notify requester to wait
+                        reconnectRequests.set(targetId, { requesterWs: ws, level: level });
+                        ws.send(JSON.stringify({ type: 'reconnect_waiting' }));
+                    }
+                    break;
+                }
+
+                case 'cancel_reconnect': {
+                    const myId = getSafeUserId(ws);
+                    for (const [target, record] of reconnectRequests.entries()) {
+                        if (getSafeUserId(record.requesterWs) === myId) {
+                            reconnectRequests.delete(target);
+                        }
+                    }
                     break;
                 }
 
@@ -345,7 +404,6 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Explicitly bind to 0.0.0.0 for Render port detection
 server.listen(PORT, '0.0.0.0', () => {
     log("SERVER", `Signaling server running on port ${PORT} (0.0.0.0)`);
 });
