@@ -26,11 +26,11 @@ const queues = {
 };
 
 // State Maps
-const activeRooms = new Map();         // roomId -> { user1, user2, startedAt }
-const recentPartners = new Map();      // userId -> { partnerId, timestamp }
-const reportRecords = new Map();       // userId -> [ { reason, timestamp } ]
-const femaleConsecutiveVip = new Map();// userId -> count
-const pendingReconnects = new Map();   // pairKey -> { requesterId, ws, level }
+const activeRooms = new Map();
+const recentPartners = new Map();
+const reportRecords = new Map();       // userId -> [ { reporterId, reason, timestamp } ]
+const femaleConsecutiveVip = new Map();
+const pendingReconnects = new Map();
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -114,7 +114,6 @@ function removeFromAllQueues(ws) {
     }
 }
 
-// Rule 20: Bilateral Call Teardown via Room Lookup
 function terminateRoomCall(ws) {
     const roomId = ws.roomId;
     let partner = ws.partnerWs;
@@ -208,7 +207,6 @@ function tryRegionalMatch(lang) {
     }
 }
 
-// Continuous Match Sweeper + Rule 36 Progressive Fallback (every 1s)
 setInterval(() => {
     const now = Date.now();
 
@@ -258,7 +256,6 @@ setInterval(() => {
     }
 }, 1000);
 
-// Rule 23: Ghost socket purger (every 25 seconds)
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
@@ -402,44 +399,64 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 20: Clean Bilateral Call Teardown
                 case 'end_call': {
                     terminateRoomCall(ws);
                     break;
                 }
 
+                // Rule 35: Deduplicated Multi-Tier Community Reporting
                 case 'report_user': {
+                    const reporterId = getSafeUserId(ws);
                     const reportedId = data.reportedPeerId;
                     const reason = data.reason || "harassment";
                     const now = Date.now();
+
+                    if (!reportedId || reportedId === reporterId) {
+                        break;
+                    }
 
                     if (!reportRecords.has(reportedId)) {
                         reportRecords.set(reportedId, []);
                     }
                     const list = reportRecords.get(reportedId);
-                    list.push({ reason: reason, timestamp: now });
 
+                    // Deduplication Check: Has this specific reporter already flagged this target in the last hour?
+                    const alreadyReported = list.some(r => r.reporterId === reporterId && (now - r.timestamp) < 3600000);
+                    if (alreadyReported) {
+                        log("REPORT_DUP", `Ignored duplicate report from ${reporterId} against ${reportedId}`);
+                        break;
+                    }
+
+                    list.push({ reporterId: reporterId, reason: reason, timestamp: now });
+                    log("REPORT_NEW", `Valid report recorded from ${reporterId} against ${reportedId} [${reason}]`);
+
+                    // 1. Gender Mismatch Revocation (Requires 3 DISTINCT reporters)
                     if (reason === "not_female") {
-                        const genderMismatchCount = list.filter(r => r.reason === "not_female").length;
-                        log("REPORT", `Target ${reportedId} has ${genderMismatchCount} gender mismatch flags.`);
-                        if (genderMismatchCount >= 3) {
+                        const uniqueMismatchReporters = new Set(
+                            list.filter(r => r.reason === "not_female").map(r => r.reporterId)
+                        );
+                        log("REPORT", `Target ${reportedId} has ${uniqueMismatchReporters.size} unique gender mismatch flags.`);
+                        if (uniqueMismatchReporters.size >= 3) {
                             wss.clients.forEach(client => {
                                 if (getSafeUserId(client) === reportedId) {
                                     client.gender = "MALE";
-                                    log("MODERATION", `Account ${reportedId} female status revoked by community reports.`);
+                                    log("MODERATION", `Account ${reportedId} female status revoked by 3 distinct reports.`);
                                 }
                             });
                         }
                     }
 
-                    const hourReports = list.filter(r => r.reason === "harassment" && (now - r.timestamp) < 3600000);
-                    if (hourReports.length >= 5) {
+                    // 2. Anti-Harassment Lockout (Requires 5 DISTINCT reporters within 1 hour)
+                    const hourReports = list.filter(r => (now - r.timestamp) < 3600000);
+                    const uniqueHourReporters = new Set(hourReports.map(r => r.reporterId));
+
+                    if (uniqueHourReporters.size >= 5) {
                         wss.clients.forEach(client => {
                             if (getSafeUserId(client) === reportedId && client.readyState === WebSocket.OPEN) {
                                 client.send(JSON.stringify({ type: 'server_cooldown', remainingSeconds: 180 }));
                             }
                         });
-                        log("MODERATION", `User ${reportedId} locked for 3 minutes (5 reports/hour).`);
+                        log("MODERATION", `User ${reportedId} locked for 3 minutes (5 DISTINCT reporters in 1 hour).`);
                     }
                     break;
                 }
