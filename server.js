@@ -30,7 +30,7 @@ const activeRooms = new Map();
 const recentPartners = new Map();
 const reportRecords = new Map();
 const femaleConsecutiveVip = new Map();
-const pendingReconnects = new Map(); // pairKey -> { userA, userB, level }
+const pendingReconnects = new Map();
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -183,8 +183,29 @@ function tryRegionalMatch(lang) {
     }
 }
 
-// Continuous Match Sweeper: runs every 1 second across all queues
+// Continuous Match Sweeper + Rule 36 Progressive Fallback (every 1s)
 setInterval(() => {
+    const now = Date.now();
+
+    // Rule 36: VIP Female progressive timeouts
+    for (let i = queues.vipFemale.length - 1; i >= 0; i--) {
+        const vip = queues.vipFemale[i];
+        const elapsed = now - vip.joinedAt;
+
+        if (elapsed >= 35000 && !vip.timedOut) {
+            vip.timedOut = true;
+            if (vip.ws.readyState === WebSocket.OPEN) {
+                vip.ws.send(JSON.stringify({ type: 'vip_queue_timeout' }));
+                log("VIP", `User ${vip.ws.userId} reached 35s fallback threshold`);
+            }
+        } else if (elapsed >= 20000 && !vip.expanded) {
+            vip.expanded = true;
+            if (vip.ws.readyState === WebSocket.OPEN) {
+                vip.ws.send(JSON.stringify({ type: 'vip_search_expanding' }));
+            }
+        }
+    }
+
     tryEnglishMatch("Beginner");
     tryEnglishMatch("Advanced");
     for (const lang in queues.regional) {
@@ -192,7 +213,6 @@ setInterval(() => {
     }
 
     // Rule 10: 5-Second Cross-Level Fallback
-    const now = Date.now();
     const beg = queues.english.Beginner;
     const adv = queues.english.Advanced;
 
@@ -248,7 +268,7 @@ wss.on('connection', (ws, req) => {
 
                     if (ws.language === "ENGLISH") {
                         if (ws.femaleOnly && (ws.isVip || data.hasFemalePass)) {
-                            queues.vipFemale.push({ ws: ws, joinedAt: Date.now() });
+                            queues.vipFemale.push({ ws: ws, joinedAt: Date.now(), expanded: false, timedOut: false });
                             log("QUEUE", `VIP User ${ws.userId} joined pool_english_vip_female`);
                         } else if (ws.gender === "FEMALE") {
                             handleFemaleMatchmaking(ws, ws.level);
@@ -267,13 +287,33 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
+                // Rule 36: VIP Fallback Handshake Actions
+                case 'extend_vip_wait': {
+                    const vipEntry = queues.vipFemale.find(item => item.ws === ws);
+                    if (vipEntry) {
+                        vipEntry.joinedAt = Date.now();
+                        vipEntry.timedOut = false;
+                        log("VIP", `User ${ws.userId} extended VIP wait +30s`);
+                    }
+                    break;
+                }
+
+                case 'fallback_to_general': {
+                    removeFromAllQueues(ws);
+                    ws.femaleOnly = false;
+                    if (!queues.english[ws.level]) queues.english[ws.level] = [];
+                    queues.english[ws.level].push({ ws: ws, joinedAt: Date.now() });
+                    log("VIP", `User ${ws.userId} fell back to general ${ws.level}`);
+                    tryEnglishMatch(ws.level);
+                    break;
+                }
+
                 case 'leave_queue': {
                     removeFromAllQueues(ws);
                     log("QUEUE", `User ${ws.userId} left queue`);
                     break;
                 }
 
-                // Rule 12: Symmetric Mutual Reconnect
                 case 'request_reconnect': {
                     removeFromAllQueues(ws);
                     const requesterId = getSafeUserId(ws);
@@ -286,7 +326,6 @@ wss.on('connection', (ws, req) => {
                     const existing = pendingReconnects.get(pairKey);
 
                     if (existing && existing.requesterId !== requesterId) {
-                        // The other peer already requested! Match them immediately
                         const otherWs = existing.ws;
                         pendingReconnects.delete(pairKey);
 
@@ -296,7 +335,6 @@ wss.on('connection', (ws, req) => {
                             ws.send(JSON.stringify({ type: 'reconnect_failed', reason: 'offline_or_busy' }));
                         }
                     } else {
-                        // Save this request and notify client to wait
                         pendingReconnects.set(pairKey, { requesterId: requesterId, ws: ws, level: level });
                         ws.send(JSON.stringify({ type: 'reconnect_waiting' }));
                     }
