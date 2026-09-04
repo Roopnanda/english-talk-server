@@ -26,11 +26,11 @@ const queues = {
 };
 
 // State Maps
-const activeRooms = new Map();
-const recentPartners = new Map();
-const reportRecords = new Map();
-const femaleConsecutiveVip = new Map();
-const pendingReconnects = new Map();
+const activeRooms = new Map();         // roomId -> { user1, user2, startedAt }
+const recentPartners = new Map();      // userId -> { partnerId, timestamp }
+const reportRecords = new Map();       // userId -> [ { reason, timestamp } ]
+const femaleConsecutiveVip = new Map();// userId -> count
+const pendingReconnects = new Map();   // pairKey -> { requesterId, ws, level }
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -114,6 +114,31 @@ function removeFromAllQueues(ws) {
     }
 }
 
+// Rule 20: Bilateral Call Teardown via Room Lookup
+function terminateRoomCall(ws) {
+    const roomId = ws.roomId;
+    let partner = ws.partnerWs;
+
+    if (roomId && activeRooms.has(roomId)) {
+        const room = activeRooms.get(roomId);
+        if (room.user1 === ws) partner = room.user2;
+        else if (room.user2 === ws) partner = room.user1;
+        activeRooms.delete(roomId);
+    }
+
+    if (partner && partner.readyState === WebSocket.OPEN) {
+        partner.send(JSON.stringify({ type: 'call_ended' }));
+        partner.inCall = false;
+        partner.roomId = null;
+        partner.partnerWs = null;
+    }
+
+    ws.inCall = false;
+    ws.roomId = null;
+    ws.partnerWs = null;
+    log("CALL", `Call terminated and cleaned for socket: ${getSafeUserId(ws)}`);
+}
+
 function tryEnglishMatch(level) {
     const queue = queues.english[level];
     if (!queue || queue.length < 2) return;
@@ -123,7 +148,7 @@ function tryEnglishMatch(level) {
             const itemA = queue[i];
             const itemB = queue[j];
 
-            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN) {
+            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN && !itemA.ws.inCall && !itemB.ws.inCall) {
                 if (isEligiblePair(itemA, itemB)) {
                     queue.splice(j, 1);
                     queue.splice(i, 1);
@@ -151,7 +176,7 @@ function handleFemaleMatchmaking(femaleWs, level) {
         const vipItem = queues.vipFemale.shift();
         const vipWs = vipItem.ws;
 
-        if (vipWs.readyState === WebSocket.OPEN && isEligiblePair({ ws: femaleWs, joinedAt: Date.now() }, vipItem)) {
+        if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall && isEligiblePair({ ws: femaleWs, joinedAt: Date.now() }, vipItem)) {
             femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
             createMatch(vipWs, femaleWs, level, "ENGLISH");
             return;
@@ -171,7 +196,7 @@ function tryRegionalMatch(lang) {
             const itemA = queue[i];
             const itemB = queue[j];
 
-            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN) {
+            if (itemA.ws.readyState === WebSocket.OPEN && itemB.ws.readyState === WebSocket.OPEN && !itemA.ws.inCall && !itemB.ws.inCall) {
                 if (isEligiblePair(itemA, itemB)) {
                     queue.splice(j, 1);
                     queue.splice(i, 1);
@@ -187,7 +212,6 @@ function tryRegionalMatch(lang) {
 setInterval(() => {
     const now = Date.now();
 
-    // Rule 36: VIP Female progressive timeouts
     for (let i = queues.vipFemale.length - 1; i >= 0; i--) {
         const vip = queues.vipFemale[i];
         const elapsed = now - vip.joinedAt;
@@ -222,7 +246,7 @@ setInterval(() => {
                 if (now - adv[j].joinedAt >= 5000) {
                     const itemA = beg[i];
                     const itemB = adv[j];
-                    if (isEligiblePair(itemA, itemB)) {
+                    if (!itemA.ws.inCall && !itemB.ws.inCall && isEligiblePair(itemA, itemB)) {
                         beg.splice(i, 1);
                         adv.splice(j, 1);
                         createMatch(itemA.ws, itemB.ws, "General", "ENGLISH");
@@ -239,6 +263,7 @@ setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
             removeFromAllQueues(ws);
+            terminateRoomCall(ws);
             return ws.terminate();
         }
         ws.isAlive = false;
@@ -260,6 +285,7 @@ wss.on('connection', (ws, req) => {
             switch (data.action) {
                 case 'join_queue': {
                     removeFromAllQueues(ws);
+                    ws.inCall = false;
                     ws.level = data.level || "Beginner";
                     ws.language = data.language || "ENGLISH";
                     ws.gender = data.gender || "MALE";
@@ -287,7 +313,6 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 36: VIP Fallback Handshake Actions
                 case 'extend_vip_wait': {
                     const vipEntry = queues.vipFemale.find(item => item.ws === ws);
                     if (vipEntry) {
@@ -377,16 +402,9 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
+                // Rule 20: Clean Bilateral Call Teardown
                 case 'end_call': {
-                    if (ws.partnerWs && ws.partnerWs.readyState === WebSocket.OPEN) {
-                        ws.partnerWs.send(JSON.stringify({ type: 'call_ended' }));
-                    }
-                    if (ws.roomId && activeRooms.has(ws.roomId)) {
-                        activeRooms.delete(ws.roomId);
-                    }
-                    ws.inCall = false;
-                    if (ws.partnerWs) ws.partnerWs.inCall = false;
-                    ws.partnerWs = null;
+                    terminateRoomCall(ws);
                     break;
                 }
 
@@ -433,13 +451,7 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         removeFromAllQueues(ws);
-        if (ws.partnerWs && ws.partnerWs.readyState === WebSocket.OPEN) {
-            ws.partnerWs.send(JSON.stringify({ type: 'call_ended' }));
-            ws.partnerWs.partnerWs = null;
-        }
-        if (ws.roomId && activeRooms.has(ws.roomId)) {
-            activeRooms.delete(ws.roomId);
-        }
+        terminateRoomCall(ws);
         log("WS", `Client disconnected: ${ws.userId}`);
     });
 });
