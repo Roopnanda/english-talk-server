@@ -3,18 +3,6 @@ const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-const server = http.createServer((req, res) => {
-    if (req.url === '/' || req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end('English Talk Signaling Server is healthy and running\n');
-    } else {
-        res.writeHead(404);
-        res.end();
-    }
-});
-
-const wss = new WebSocket.Server({ server });
-
 // Queues
 const queues = {
     english: {
@@ -39,6 +27,28 @@ function log(tag, msg) {
 function getSafeUserId(ws) {
     return ws.userId || (ws._socket && ws._socket.remoteAddress ? ws._socket.remoteAddress + ":" + ws._socket.remotePort : "unknown");
 }
+
+const server = http.createServer((req, res) => {
+    if (req.url === '/' || req.url === '/health') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('English Talk Signaling Server is healthy and running\n');
+    } else if (req.url === '/status') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        const summary = {
+            totalClients: wss.clients.size,
+            beginnerQueue: queues.english.Beginner.map(item => getSafeUserId(item.ws)),
+            advancedQueue: queues.english.Advanced.map(item => getSafeUserId(item.ws)),
+            vipFemaleQueue: queues.vipFemale.map(item => getSafeUserId(item.ws)),
+            activeRoomsCount: activeRooms.size
+        };
+        res.end(JSON.stringify(summary, null, 2));
+    } else {
+        res.writeHead(404);
+        res.end();
+    }
+});
+
+const wss = new WebSocket.Server({ server });
 
 function isEligiblePair(itemA, itemB) {
     const now = Date.now();
@@ -159,6 +169,38 @@ function tryEnglishMatch(level) {
     }
 }
 
+function tryVipFemaleSweeper() {
+    if (queues.vipFemale.length === 0) return;
+
+    const levels = ["Beginner", "Advanced"];
+    for (const lvl of levels) {
+        const queue = queues.english[lvl];
+        for (let i = 0; i < queue.length; i++) {
+            const candidate = queue[i];
+            if (candidate.ws.gender === "FEMALE" && candidate.ws.readyState === WebSocket.OPEN && !candidate.ws.inCall) {
+                const femaleWs = candidate.ws;
+                const femaleId = getSafeUserId(femaleWs);
+                const consecutiveVip = femaleConsecutiveVip.get(femaleId) || 0;
+
+                if (consecutiveVip >= 2) {
+                    continue;
+                }
+
+                if (queues.vipFemale.length > 0) {
+                    const vipItem = queues.vipFemale.shift();
+                    const vipWs = vipItem.ws;
+                    if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall) {
+                        queue.splice(i, 1);
+                        femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
+                        createMatch(vipWs, femaleWs, lvl, "ENGLISH");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 function handleFemaleMatchmaking(femaleWs, level) {
     const femaleId = getSafeUserId(femaleWs);
     const consecutiveVip = femaleConsecutiveVip.get(femaleId) || 0;
@@ -171,7 +213,6 @@ function handleFemaleMatchmaking(femaleWs, level) {
         return;
     }
 
-    // Direct match for VIP Female: Bypasses anti-repeat to guarantee priority fulfillment
     if (queues.vipFemale.length > 0) {
         const vipItem = queues.vipFemale.shift();
         const vipWs = vipItem.ws;
@@ -211,7 +252,6 @@ function tryRegionalMatch(lang) {
 setInterval(() => {
     const now = Date.now();
 
-    // Rule 36: VIP Female progressive timeouts (30-35s cycle)
     for (let i = queues.vipFemale.length - 1; i >= 0; i--) {
         const vip = queues.vipFemale[i];
         const elapsed = now - vip.joinedAt;
@@ -230,13 +270,13 @@ setInterval(() => {
         }
     }
 
+    tryVipFemaleSweeper();
     tryEnglishMatch("Beginner");
     tryEnglishMatch("Advanced");
     for (const lang in queues.regional) {
         tryRegionalMatch(lang);
     }
 
-    // Rule 10: 5-Second Cross-Level Fallback
     const beg = queues.english.Beginner;
     const adv = queues.english.Advanced;
 
@@ -303,6 +343,7 @@ wss.on('connection', (ws, req) => {
                         if (ws.femaleOnly && (ws.isVip || data.hasFemalePass)) {
                             queues.vipFemale.push({ ws: ws, joinedAt: Date.now(), expanded: false, timedOut: false });
                             log("QUEUE", `VIP User ${ws.userId} joined pool_english_vip_female`);
+                            tryVipFemaleSweeper();
                         } else if (ws.gender === "FEMALE") {
                             handleFemaleMatchmaking(ws, ws.level);
                         } else {
