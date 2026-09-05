@@ -171,11 +171,12 @@ function handleFemaleMatchmaking(femaleWs, level) {
         return;
     }
 
+    // Direct match for VIP Female: Bypasses anti-repeat to guarantee priority fulfillment
     if (queues.vipFemale.length > 0) {
         const vipItem = queues.vipFemale.shift();
         const vipWs = vipItem.ws;
 
-        if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall && isEligiblePair({ ws: femaleWs, joinedAt: Date.now() }, vipItem)) {
+        if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall) {
             femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
             createMatch(vipWs, femaleWs, level, "ENGLISH");
             return;
@@ -281,6 +282,14 @@ wss.on('connection', (ws, req) => {
             const data = JSON.parse(message);
 
             switch (data.action) {
+                case 'ping': {
+                    ws.isAlive = true;
+                    if (ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({ type: 'pong' }));
+                    }
+                    break;
+                }
+
                 case 'join_queue': {
                     removeFromAllQueues(ws);
                     ws.inCall = false;
@@ -311,25 +320,23 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 36: Resets timer completely so the 30s re-prompt cycle continues!
                 case 'extend_vip_wait': {
                     const vipEntry = queues.vipFemale.find(item => item.ws === ws);
                     if (vipEntry) {
                         vipEntry.joinedAt = Date.now();
                         vipEntry.timedOut = false;
                         vipEntry.expanded = false;
-                        log("VIP", `User ${ws.userId} extended VIP wait +30s (Cycle reset)`);
+                        log("VIP", `User ${ws.userId} extended VIP wait +30s`);
                     }
                     break;
                 }
 
-                // Rule 36: Fallback to general cleans cooldown to match immediately
                 case 'fallback_to_general': {
                     removeFromAllQueues(ws);
                     ws.femaleOnly = false;
-                    recentPartners.delete(getSafeUserId(ws)); // Clear any residual lock
+                    recentPartners.delete(getSafeUserId(ws));
                     if (!queues.english[ws.level]) queues.english[ws.level] = [];
-                    queues.english[ws.level].push({ ws: ws, joinedAt: Date.now() - 4000 }); // Mark as waited >= 3s to match instantly
+                    queues.english[ws.level].push({ ws: ws, joinedAt: Date.now() - 4000 });
                     log("VIP", `User ${ws.userId} fell back to general ${ws.level}`);
                     tryEnglishMatch(ws.level);
                     break;
