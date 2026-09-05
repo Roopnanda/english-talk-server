@@ -210,17 +210,18 @@ function tryRegionalMatch(lang) {
 setInterval(() => {
     const now = Date.now();
 
+    // Rule 36: VIP Female progressive timeouts (30-35s cycle)
     for (let i = queues.vipFemale.length - 1; i >= 0; i--) {
         const vip = queues.vipFemale[i];
         const elapsed = now - vip.joinedAt;
 
-        if (elapsed >= 35000 && !vip.timedOut) {
+        if (elapsed >= 30000 && !vip.timedOut) {
             vip.timedOut = true;
             if (vip.ws.readyState === WebSocket.OPEN) {
                 vip.ws.send(JSON.stringify({ type: 'vip_queue_timeout' }));
-                log("VIP", `User ${vip.ws.userId} reached 35s fallback threshold`);
+                log("VIP", `User ${vip.ws.userId} reached timeout threshold (Prompting wait vs fallback)`);
             }
-        } else if (elapsed >= 20000 && !vip.expanded) {
+        } else if (elapsed >= 15000 && !vip.expanded) {
             vip.expanded = true;
             if (vip.ws.readyState === WebSocket.OPEN) {
                 vip.ws.send(JSON.stringify({ type: 'vip_search_expanding' }));
@@ -310,21 +311,25 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
+                // Rule 36: Resets timer completely so the 30s re-prompt cycle continues!
                 case 'extend_vip_wait': {
                     const vipEntry = queues.vipFemale.find(item => item.ws === ws);
                     if (vipEntry) {
                         vipEntry.joinedAt = Date.now();
                         vipEntry.timedOut = false;
-                        log("VIP", `User ${ws.userId} extended VIP wait +30s`);
+                        vipEntry.expanded = false;
+                        log("VIP", `User ${ws.userId} extended VIP wait +30s (Cycle reset)`);
                     }
                     break;
                 }
 
+                // Rule 36: Fallback to general cleans cooldown to match immediately
                 case 'fallback_to_general': {
                     removeFromAllQueues(ws);
                     ws.femaleOnly = false;
+                    recentPartners.delete(getSafeUserId(ws)); // Clear any residual lock
                     if (!queues.english[ws.level]) queues.english[ws.level] = [];
-                    queues.english[ws.level].push({ ws: ws, joinedAt: Date.now() });
+                    queues.english[ws.level].push({ ws: ws, joinedAt: Date.now() - 4000 }); // Mark as waited >= 3s to match instantly
                     log("VIP", `User ${ws.userId} fell back to general ${ws.level}`);
                     tryEnglishMatch(ws.level);
                     break;
@@ -404,7 +409,6 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 35: Deduplicated Multi-Tier Community Reporting
                 case 'report_user': {
                     const reporterId = getSafeUserId(ws);
                     const reportedId = data.reportedPeerId;
@@ -420,7 +424,6 @@ wss.on('connection', (ws, req) => {
                     }
                     const list = reportRecords.get(reportedId);
 
-                    // Deduplication Check: Has this specific reporter already flagged this target in the last hour?
                     const alreadyReported = list.some(r => r.reporterId === reporterId && (now - r.timestamp) < 3600000);
                     if (alreadyReported) {
                         log("REPORT_DUP", `Ignored duplicate report from ${reporterId} against ${reportedId}`);
@@ -430,7 +433,6 @@ wss.on('connection', (ws, req) => {
                     list.push({ reporterId: reporterId, reason: reason, timestamp: now });
                     log("REPORT_NEW", `Valid report recorded from ${reporterId} against ${reportedId} [${reason}]`);
 
-                    // 1. Gender Mismatch Revocation (Requires 3 DISTINCT reporters)
                     if (reason === "not_female") {
                         const uniqueMismatchReporters = new Set(
                             list.filter(r => r.reason === "not_female").map(r => r.reporterId)
@@ -446,7 +448,6 @@ wss.on('connection', (ws, req) => {
                         }
                     }
 
-                    // 2. Anti-Harassment Lockout (Requires 5 DISTINCT reporters within 1 hour)
                     const hourReports = list.filter(r => (now - r.timestamp) < 3600000);
                     const uniqueHourReporters = new Set(hourReports.map(r => r.reporterId));
 
