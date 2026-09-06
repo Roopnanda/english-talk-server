@@ -16,7 +16,7 @@ const queues = {
 // State Maps
 const activeRooms = new Map();
 const recentPartners = new Map();
-const reportRecords = new Map();       // userId -> [ { reporterId, reason, timestamp } ]
+const reportRecords = new Map();
 const femaleConsecutiveVip = new Map();
 const pendingReconnects = new Map();
 
@@ -35,11 +35,18 @@ const server = http.createServer((req, res) => {
     } else if (req.url === '/status') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         const summary = {
-            totalClients: wss.clients.size,
-            beginnerQueue: queues.english.Beginner.map(item => getSafeUserId(item.ws)),
-            advancedQueue: queues.english.Advanced.map(item => getSafeUserId(item.ws)),
-            vipFemaleQueue: queues.vipFemale.map(item => getSafeUserId(item.ws)),
-            activeRoomsCount: activeRooms.size
+            totalConnectedSockets: wss.clients.size,
+            activeCallsCount: activeRooms.size,
+            queues: {
+                englishBeginner: queues.english.Beginner.map(item => ({ id: getSafeUserId(item.ws), gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                englishAdvanced: queues.english.Advanced.map(item => ({ id: getSafeUserId(item.ws), gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                vipFemaleQueue: queues.vipFemale.map(item => ({ id: getSafeUserId(item.ws), waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                regionalPools: Object.keys(queues.regional).reduce((acc, lang) => {
+                    acc[lang] = queues.regional[lang].map(item => getSafeUserId(item.ws));
+                    return acc;
+                }, {})
+            },
+            timestamp: new Date().toISOString()
         };
         res.end(JSON.stringify(summary, null, 2));
     } else {
@@ -55,7 +62,6 @@ function isEligiblePair(itemA, itemB) {
     const waitA = now - (itemA.joinedAt || now);
     const waitB = now - (itemB.joinedAt || now);
 
-    // Rule 22 Fallback: If either user has been in queue for >= 3 seconds, bypass anti-repeat
     if (waitA >= 3000 || waitB >= 3000) {
         return true;
     }
@@ -260,7 +266,7 @@ setInterval(() => {
             vip.timedOut = true;
             if (vip.ws.readyState === WebSocket.OPEN) {
                 vip.ws.send(JSON.stringify({ type: 'vip_queue_timeout' }));
-                log("VIP", `User ${vip.ws.userId} reached timeout threshold (Prompting wait vs fallback)`);
+                log("VIP", `User ${vip.ws.userId} reached timeout threshold`);
             }
         } else if (elapsed >= 15000 && !vip.expanded) {
             vip.expanded = true;
@@ -308,7 +314,7 @@ setInterval(() => {
         ws.isAlive = false;
         ws.ping();
     });
-}, 25000);
+}, 20000);
 
 wss.on('connection', (ws, req) => {
     ws.isAlive = true;
@@ -345,6 +351,7 @@ wss.on('connection', (ws, req) => {
                             log("QUEUE", `VIP User ${ws.userId} joined pool_english_vip_female`);
                             tryVipFemaleSweeper();
                         } else if (ws.gender === "FEMALE") {
+                            log("QUEUE", `Female User ${ws.userId} joined pool_english_${ws.level}`);
                             handleFemaleMatchmaking(ws, ws.level);
                         } else {
                             if (!queues.english[ws.level]) queues.english[ws.level] = [];
