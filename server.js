@@ -38,9 +38,9 @@ const server = http.createServer((req, res) => {
             totalConnectedSockets: wss.clients.size,
             activeCallsCount: activeRooms.size,
             queues: {
-                englishBeginner: queues.english.Beginner.map(item => ({ id: getSafeUserId(item.ws), gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
-                englishAdvanced: queues.english.Advanced.map(item => ({ id: getSafeUserId(item.ws), gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
-                vipFemaleQueue: queues.vipFemale.map(item => ({ id: getSafeUserId(item.ws), waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                englishBeginner: queues.english.Beginner.map(item => ({ id: getSafeUserId(item.ws), deviceId: item.ws.deviceId, gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                englishAdvanced: queues.english.Advanced.map(item => ({ id: getSafeUserId(item.ws), deviceId: item.ws.deviceId, gender: item.ws.gender, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
+                vipFemaleQueue: queues.vipFemale.map(item => ({ id: getSafeUserId(item.ws), deviceId: item.ws.deviceId, waitSec: Math.floor((Date.now() - item.joinedAt) / 1000) })),
                 regionalPools: Object.keys(queues.regional).reduce((acc, lang) => {
                     acc[lang] = queues.regional[lang].map(item => getSafeUserId(item.ws));
                     return acc;
@@ -58,6 +58,16 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 function isEligiblePair(itemA, itemB) {
+    if (itemA.ws === itemB.ws) return false;
+    const idA = getSafeUserId(itemA.ws);
+    const idB = getSafeUserId(itemB.ws);
+    if (idA === idB) return false;
+
+    // Strict Device-Level Self Match Guard
+    if (itemA.ws.deviceId && itemB.ws.deviceId && itemA.ws.deviceId === itemB.ws.deviceId) {
+        return false;
+    }
+
     const now = Date.now();
     const waitA = now - (itemA.joinedAt || now);
     const waitB = now - (itemB.joinedAt || now);
@@ -66,10 +76,7 @@ function isEligiblePair(itemA, itemB) {
         return true;
     }
 
-    const idA = getSafeUserId(itemA.ws);
-    const idB = getSafeUserId(itemB.ws);
     const prevA = recentPartners.get(idA);
-
     if (prevA && prevA.partnerId === idB && (now - prevA.timestamp) < 300000) {
         return false;
     }
@@ -115,16 +122,23 @@ function createMatch(userA, userB, level, language, isReconnect = false) {
 }
 
 function removeFromAllQueues(ws) {
+    const devId = ws.deviceId;
+    const filterFn = (item) => {
+        if (item.ws === ws) return false;
+        if (devId && item.ws.deviceId && item.ws.deviceId === devId) return false;
+        return true;
+    };
+
     for (const level in queues.english) {
-        queues.english[level] = queues.english[level].filter(item => item.ws !== ws);
+        queues.english[level] = queues.english[level].filter(filterFn);
     }
-    queues.vipFemale = queues.vipFemale.filter(item => item.ws !== ws);
+    queues.vipFemale = queues.vipFemale.filter(filterFn);
     for (const lang in queues.regional) {
-        queues.regional[lang] = queues.regional[lang].filter(item => item.ws !== ws);
+        queues.regional[lang] = queues.regional[lang].filter(filterFn);
     }
     const myId = getSafeUserId(ws);
     for (const [key, obj] of pendingReconnects.entries()) {
-        if (obj.requesterId === myId) {
+        if (obj.requesterId === myId || (devId && obj.deviceId === devId)) {
             pendingReconnects.delete(key);
         }
     }
@@ -196,6 +210,10 @@ function tryVipFemaleSweeper() {
                     const vipItem = queues.vipFemale.shift();
                     const vipWs = vipItem.ws;
                     if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall) {
+                        if (!isEligiblePair({ ws: vipWs }, candidate)) {
+                            queues.vipFemale.unshift(vipItem);
+                            continue;
+                        }
                         queue.splice(i, 1);
                         femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
                         createMatch(vipWs, femaleWs, lvl, "ENGLISH");
@@ -224,9 +242,13 @@ function handleFemaleMatchmaking(femaleWs, level) {
         const vipWs = vipItem.ws;
 
         if (vipWs.readyState === WebSocket.OPEN && !vipWs.inCall) {
-            femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
-            createMatch(vipWs, femaleWs, level, "ENGLISH");
-            return;
+            if (isEligiblePair({ ws: vipWs }, { ws: femaleWs })) {
+                femaleConsecutiveVip.set(femaleId, consecutiveVip + 1);
+                createMatch(vipWs, femaleWs, level, "ENGLISH");
+                return;
+            } else {
+                queues.vipFemale.unshift(vipItem);
+            }
         }
     }
 
@@ -337,6 +359,7 @@ wss.on('connection', (ws, req) => {
                 }
 
                 case 'join_queue': {
+                    ws.deviceId = data.deviceId || ws.userId;
                     removeFromAllQueues(ws);
                     ws.inCall = false;
                     ws.level = data.level || "Beginner";
@@ -397,6 +420,7 @@ wss.on('connection', (ws, req) => {
                 }
 
                 case 'request_reconnect': {
+                    ws.deviceId = data.deviceId || ws.userId;
                     removeFromAllQueues(ws);
                     const requesterId = getSafeUserId(ws);
                     const targetId = data.targetPeerId;
@@ -417,7 +441,7 @@ wss.on('connection', (ws, req) => {
                             ws.send(JSON.stringify({ type: 'reconnect_failed', reason: 'offline_or_busy' }));
                         }
                     } else {
-                        pendingReconnects.set(pairKey, { requesterId: requesterId, ws: ws, level: level });
+                        pendingReconnects.set(pairKey, { requesterId: requesterId, ws: ws, level: level, deviceId: ws.deviceId });
                         ws.send(JSON.stringify({ type: 'reconnect_waiting' }));
                     }
                     break;
@@ -426,7 +450,7 @@ wss.on('connection', (ws, req) => {
                 case 'cancel_reconnect': {
                     const myId = getSafeUserId(ws);
                     for (const [key, obj] of pendingReconnects.entries()) {
-                        if (obj.requesterId === myId) {
+                        if (obj.requesterId === myId || (ws.deviceId && obj.deviceId === ws.deviceId)) {
                             pendingReconnects.delete(key);
                         }
                     }
