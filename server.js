@@ -19,7 +19,7 @@ const recentPartners = new Map();
 const reportRecords = new Map();
 const femaleConsecutiveVip = new Map();
 const pendingReconnects = new Map();
-const pendingRoomTeardowns = new Map(); // Rule 44: 10-second grace period for data toggle recovery
+const pendingRoomTeardowns = new Map();
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -99,8 +99,8 @@ function createMatch(userA, userB, level, language, isReconnect = false) {
     activeRooms.set(roomId, { 
         user1: userA, 
         user2: userB, 
-        deviceId1: userA.deviceId, 
-        deviceId2: userB.deviceId, 
+        deviceId1: userA.deviceId || idA, 
+        deviceId2: userB.deviceId || idB, 
         startedAt: Date.now() 
     });
 
@@ -151,14 +151,21 @@ function removeFromAllQueues(ws) {
     }
 }
 
-function terminateRoomCall(ws) {
-    const roomId = ws.roomId;
+function terminateRoomCall(ws, targetRoomId = null) {
+    const roomId = targetRoomId || ws.roomId;
     let partner = ws.partnerWs;
 
     if (roomId && activeRooms.has(roomId)) {
         const room = activeRooms.get(roomId);
-        if (room.user1 === ws) partner = room.user2;
-        else if (room.user2 === ws) partner = room.user1;
+        if (room.user1 === ws || (ws.deviceId && room.deviceId1 === ws.deviceId)) {
+            partner = room.user2;
+        } else if (room.user2 === ws || (ws.deviceId && room.deviceId2 === ws.deviceId)) {
+            partner = room.user1;
+        } else {
+            if (room.user1 && room.user1 !== ws) partner = room.user1;
+            else partner = room.user2;
+        }
+
         activeRooms.delete(roomId);
         if (pendingRoomTeardowns.has(roomId)) {
             clearTimeout(pendingRoomTeardowns.get(roomId));
@@ -171,12 +178,13 @@ function terminateRoomCall(ws) {
         partner.inCall = false;
         partner.roomId = null;
         partner.partnerWs = null;
+        log("CALL", `Sent call_ended to partner: ${getSafeUserId(partner)}`);
     }
 
     ws.inCall = false;
     ws.roomId = null;
     ws.partnerWs = null;
-    log("CALL", `Call terminated and cleaned for socket: ${getSafeUserId(ws)}`);
+    log("CALL", `Call cleaned up for room: ${roomId || 'unknown'}`);
 }
 
 function tryEnglishMatch(level) {
@@ -337,6 +345,7 @@ setInterval(() => {
     }
 }, 1000);
 
+// Active heartbeat probe every 10s to swiftly detect disconnected carrier sockets
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
@@ -347,7 +356,7 @@ setInterval(() => {
         ws.isAlive = false;
         ws.ping();
     });
-}, 20000);
+}, 10000);
 
 wss.on('connection', (ws, req) => {
     ws.isAlive = true;
@@ -369,7 +378,7 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 44: Mid-call room re-attachment upon socket reconnect
+                // Rule 44: Robust mid-call room re-attachment
                 case 'sync_active_call': {
                     const roomId = data.roomId;
                     const deviceId = data.deviceId;
@@ -383,20 +392,20 @@ wss.on('connection', (ws, req) => {
                             ws.inCall = true;
                             ws.partnerWs = room.user2;
                             if (room.user2) room.user2.partnerWs = ws;
-                            log("SYNC", `Re-bound User1 on socket ${ws.userId} to room ${roomId}`);
+                            log("SYNC", `Re-bound User1 (${ws.userId}) to room ${roomId}`);
                         } else if (room.deviceId2 === deviceId || (room.user2 && room.user2.deviceId === deviceId)) {
                             room.user2 = ws;
                             ws.roomId = roomId;
                             ws.inCall = true;
                             ws.partnerWs = room.user1;
                             if (room.user1) room.user1.partnerWs = ws;
-                            log("SYNC", `Re-bound User2 on socket ${ws.userId} to room ${roomId}`);
+                            log("SYNC", `Re-bound User2 (${ws.userId}) to room ${roomId}`);
                         }
 
                         if (pendingRoomTeardowns.has(roomId)) {
                             clearTimeout(pendingRoomTeardowns.get(roomId));
                             pendingRoomTeardowns.delete(roomId);
-                            log("SYNC", `Cancelled pending teardown for active room ${roomId}`);
+                            log("SYNC", `Cancelled teardown for room ${roomId}`);
                         }
                     }
                     break;
@@ -528,7 +537,7 @@ wss.on('connection', (ws, req) => {
                 }
 
                 case 'end_call': {
-                    terminateRoomCall(ws);
+                    terminateRoomCall(ws, data.roomId);
                     break;
                 }
 
@@ -593,14 +602,13 @@ wss.on('connection', (ws, req) => {
     ws.on('close', () => {
         removeFromAllQueues(ws);
 
-        // Rule 44: Hold room for 10s grace period if socket drops mid-call
         if (ws.inCall && ws.roomId && activeRooms.has(ws.roomId)) {
             const currentRoomId = ws.roomId;
             log("WS", `Client ${ws.userId} disconnected mid-call. Holding room ${currentRoomId} for 10s grace period...`);
             
             const timer = setTimeout(() => {
                 pendingRoomTeardowns.delete(currentRoomId);
-                terminateRoomCall(ws);
+                terminateRoomCall(ws, currentRoomId);
             }, 10000);
             pendingRoomTeardowns.set(currentRoomId, timer);
         } else {
