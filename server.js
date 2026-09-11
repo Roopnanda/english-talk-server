@@ -19,6 +19,7 @@ const recentPartners = new Map();
 const reportRecords = new Map();
 const femaleConsecutiveVip = new Map();
 const pendingReconnects = new Map();
+const pendingRoomTeardowns = new Map(); // Rule 44: 10-second grace period for data toggle recovery
 
 function log(tag, msg) {
     console.log(`[${new Date().toISOString().substring(11, 19)}][${tag}] ${msg}`);
@@ -95,7 +96,13 @@ function createMatch(userA, userB, level, language, isReconnect = false) {
     userA.inCall = true;
     userB.inCall = true;
 
-    activeRooms.set(roomId, { user1: userA, user2: userB, startedAt: Date.now() });
+    activeRooms.set(roomId, { 
+        user1: userA, 
+        user2: userB, 
+        deviceId1: userA.deviceId, 
+        deviceId2: userB.deviceId, 
+        startedAt: Date.now() 
+    });
 
     recentPartners.set(idA, { partnerId: idB, timestamp: Date.now() });
     recentPartners.set(idB, { partnerId: idA, timestamp: Date.now() });
@@ -153,6 +160,10 @@ function terminateRoomCall(ws) {
         if (room.user1 === ws) partner = room.user2;
         else if (room.user2 === ws) partner = room.user1;
         activeRooms.delete(roomId);
+        if (pendingRoomTeardowns.has(roomId)) {
+            clearTimeout(pendingRoomTeardowns.get(roomId));
+            pendingRoomTeardowns.delete(roomId);
+        }
     }
 
     if (partner && partner.readyState === WebSocket.OPEN) {
@@ -358,6 +369,39 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
+                // Rule 44: Mid-call room re-attachment upon socket reconnect
+                case 'sync_active_call': {
+                    const roomId = data.roomId;
+                    const deviceId = data.deviceId;
+                    ws.deviceId = deviceId || ws.deviceId;
+
+                    if (roomId && activeRooms.has(roomId)) {
+                        const room = activeRooms.get(roomId);
+                        if (room.deviceId1 === deviceId || (room.user1 && room.user1.deviceId === deviceId)) {
+                            room.user1 = ws;
+                            ws.roomId = roomId;
+                            ws.inCall = true;
+                            ws.partnerWs = room.user2;
+                            if (room.user2) room.user2.partnerWs = ws;
+                            log("SYNC", `Re-bound User1 on socket ${ws.userId} to room ${roomId}`);
+                        } else if (room.deviceId2 === deviceId || (room.user2 && room.user2.deviceId === deviceId)) {
+                            room.user2 = ws;
+                            ws.roomId = roomId;
+                            ws.inCall = true;
+                            ws.partnerWs = room.user1;
+                            if (room.user1) room.user1.partnerWs = ws;
+                            log("SYNC", `Re-bound User2 on socket ${ws.userId} to room ${roomId}`);
+                        }
+
+                        if (pendingRoomTeardowns.has(roomId)) {
+                            clearTimeout(pendingRoomTeardowns.get(roomId));
+                            pendingRoomTeardowns.delete(roomId);
+                            log("SYNC", `Cancelled pending teardown for active room ${roomId}`);
+                        }
+                    }
+                    break;
+                }
+
                 case 'join_queue': {
                     ws.deviceId = data.deviceId || ws.userId;
                     removeFromAllQueues(ws);
@@ -548,7 +592,21 @@ wss.on('connection', (ws, req) => {
 
     ws.on('close', () => {
         removeFromAllQueues(ws);
-        terminateRoomCall(ws);
+
+        // Rule 44: Hold room for 10s grace period if socket drops mid-call
+        if (ws.inCall && ws.roomId && activeRooms.has(ws.roomId)) {
+            const currentRoomId = ws.roomId;
+            log("WS", `Client ${ws.userId} disconnected mid-call. Holding room ${currentRoomId} for 10s grace period...`);
+            
+            const timer = setTimeout(() => {
+                pendingRoomTeardowns.delete(currentRoomId);
+                terminateRoomCall(ws);
+            }, 10000);
+            pendingRoomTeardowns.set(currentRoomId, timer);
+        } else {
+            terminateRoomCall(ws);
+        }
+
         log("WS", `Client disconnected: ${ws.userId}`);
     });
 });
