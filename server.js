@@ -153,17 +153,19 @@ function removeFromAllQueues(ws) {
 
 function terminateRoomCall(ws, targetRoomId = null) {
     const roomId = targetRoomId || ws.roomId;
-    let partner = ws.partnerWs;
+    const recipients = [];
 
     if (roomId && activeRooms.has(roomId)) {
         const room = activeRooms.get(roomId);
-        if (room.user1 === ws || (ws.deviceId && room.deviceId1 === ws.deviceId)) {
-            partner = room.user2;
-        } else if (room.user2 === ws || (ws.deviceId && room.deviceId2 === ws.deviceId)) {
-            partner = room.user1;
-        } else {
-            if (room.user1 && room.user1 !== ws) partner = room.user1;
-            else partner = room.user2;
+
+        // Collect both users to ensure delivery even during fast socket shifts
+        if (room.user1 && room.user1 !== ws) recipients.push(room.user1);
+        if (room.user2 && room.user2 !== ws) recipients.push(room.user2);
+
+        // If ws is not recognized as either, notify both to prevent stranding
+        if (recipients.length === 0) {
+            if (room.user1) recipients.push(room.user1);
+            if (room.user2) recipients.push(room.user2);
         }
 
         activeRooms.delete(roomId);
@@ -171,14 +173,20 @@ function terminateRoomCall(ws, targetRoomId = null) {
             clearTimeout(pendingRoomTeardowns.get(roomId));
             pendingRoomTeardowns.delete(roomId);
         }
+    } else if (ws.partnerWs) {
+        recipients.push(ws.partnerWs);
     }
 
-    if (partner && partner.readyState === WebSocket.OPEN) {
-        partner.send(JSON.stringify({ type: 'call_ended' }));
-        partner.inCall = false;
-        partner.roomId = null;
-        partner.partnerWs = null;
-        log("CALL", `Sent call_ended to partner: ${getSafeUserId(partner)}`);
+    for (const partner of recipients) {
+        if (partner && partner.readyState === WebSocket.OPEN) {
+            try {
+                partner.send(JSON.stringify({ type: 'call_ended' }));
+                partner.inCall = false;
+                partner.roomId = null;
+                partner.partnerWs = null;
+                log("CALL", `Sent call_ended to partner: ${getSafeUserId(partner)}`);
+            } catch (e) {}
+        }
     }
 
     ws.inCall = false;
@@ -345,7 +353,7 @@ setInterval(() => {
     }
 }, 1000);
 
-// Active heartbeat probe every 10s to swiftly detect disconnected carrier sockets
+// Active probe every 10s to detect broken connections
 setInterval(() => {
     wss.clients.forEach(ws => {
         if (!ws.isAlive) {
@@ -378,7 +386,7 @@ wss.on('connection', (ws, req) => {
                     break;
                 }
 
-                // Rule 44: Robust mid-call room re-attachment
+                // Rule 44: Guaranteed room re-attachment
                 case 'sync_active_call': {
                     const roomId = data.roomId;
                     const deviceId = data.deviceId;
@@ -393,7 +401,7 @@ wss.on('connection', (ws, req) => {
                             ws.partnerWs = room.user2;
                             if (room.user2) room.user2.partnerWs = ws;
                             log("SYNC", `Re-bound User1 (${ws.userId}) to room ${roomId}`);
-                        } else if (room.deviceId2 === deviceId || (room.user2 && room.user2.deviceId === deviceId)) {
+                        } else {
                             room.user2 = ws;
                             ws.roomId = roomId;
                             ws.inCall = true;
